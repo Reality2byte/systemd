@@ -41,8 +41,14 @@
 
 bool isatty_safe(int fd);
 
-int terminal_reset_defensive(int fd, bool switch_to_text);
-int terminal_reset_defensive_locked(int fd, bool switch_to_text);
+typedef enum TerminalResetFlags {
+        TERMINAL_RESET_SWITCH_TO_TEXT = 1 << 0,
+        TERMINAL_RESET_AVOID_ANSI_SEQ = 1 << 1,
+        TERMINAL_RESET_FORCE_ANSI_SEQ = 1 << 2,
+} TerminalResetFlags;
+
+int terminal_reset_defensive(int fd, TerminalResetFlags flags);
+int terminal_reset_defensive_locked(int fd, TerminalResetFlags flags);
 
 int terminal_set_cursor_position(int fd, unsigned row, unsigned column);
 
@@ -80,11 +86,15 @@ int proc_cmdline_tty_size(const char *tty, unsigned *ret_rows, unsigned *ret_col
 
 int chvt(int vt);
 
-int read_one_char(FILE *f, char *ret, usec_t timeout, bool *need_nl);
+int read_one_char(FILE *f, char *ret, usec_t timeout, bool echo, bool *need_nl);
 int ask_char(char *ret, const char *replies, const char *text, ...) _printf_(3, 4);
-int ask_string(char **ret, const char *text, ...) _printf_(2, 3);
+
+typedef int (*GetCompletionsCallback)(const char *key, char ***ret_list, void *userdata);
+int ask_string_full(char **ret, GetCompletionsCallback cb, void *userdata, const char *text, ...) _printf_(4, 5);
+#define ask_string(ret, text, ...) ask_string_full(ret, NULL, NULL, text, ##__VA_ARGS__)
+
 bool any_key_to_proceed(void);
-int show_menu(char **x, unsigned n_columns, unsigned width, unsigned percentage);
+int show_menu(char **x, size_t n_columns, size_t column_width, unsigned ellipsize_percentage, const char *grey_prefix, bool with_numbers);
 
 int vt_disallocate(const char *name);
 

@@ -52,6 +52,10 @@
         _Pragma("GCC diagnostic push");                                 \
         _Pragma("GCC diagnostic ignored \"-Wstringop-truncation\"")
 
+#define DISABLE_WARNING_REDUNDANT_DECLS                                 \
+        _Pragma("GCC diagnostic push");                                 \
+        _Pragma("GCC diagnostic ignored \"-Wredundant-decls\"")
+
 #if HAVE_WARNING_ZERO_LENGTH_BOUNDS
 #  define DISABLE_WARNING_ZERO_LENGTH_BOUNDS                            \
         _Pragma("GCC diagnostic push");                                 \
@@ -110,6 +114,12 @@
 #  define _fallthrough_
 #else
 #  define _fallthrough_ __attribute__((__fallthrough__))
+#endif
+
+#if __GNUC__ >= 15
+#  define _nonnull_if_nonzero_(p, n) __attribute__((nonnull_if_nonzero(p, n)))
+#else
+#  define _nonnull_if_nonzero_(p, n)
 #endif
 
 #define XSTRINGIFY(x) #x

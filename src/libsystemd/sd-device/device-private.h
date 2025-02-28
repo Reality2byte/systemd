@@ -18,6 +18,7 @@ int device_new_from_strv(sd_device **ret, char **strv);
 
 int device_opendir(sd_device *device, const char *subdir, DIR **ret);
 
+int device_get_sysnum_unsigned(sd_device *device, unsigned *ret);
 int device_get_property_bool(sd_device *device, const char *key);
 int device_get_property_int(sd_device *device, const char *key, int *ret);
 int device_get_sysattr_int(sd_device *device, const char *sysattr, int *ret_value);
@@ -77,4 +78,3 @@ int device_read_uevent_file(sd_device *device);
 int device_set_action(sd_device *device, sd_device_action_t a);
 sd_device_action_t device_action_from_string(const char *s) _pure_;
 const char* device_action_to_string(sd_device_action_t a) _const_;
-void dump_device_action_table(void);

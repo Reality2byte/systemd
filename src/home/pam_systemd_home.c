@@ -1,6 +1,7 @@
 /* SPDX-License-Identifier: LGPL-2.1-or-later */
 
 #include <security/pam_ext.h>
+#include <security/pam_misc.h>
 #include <security/pam_modules.h>
 
 #include "sd-bus.h"
@@ -15,6 +16,7 @@
 #include "memory-util.h"
 #include "pam-util.h"
 #include "parse-util.h"
+#include "path-util.h"
 #include "strv.h"
 #include "user-record-util.h"
 #include "user-record.h"
@@ -112,6 +114,20 @@ static int acquire_user_record(
                         return pam_syslog_pam_error(handle, LOG_ERR, r, "Failed to get user name: @PAMERR@");
                 if (isempty(username))
                         return pam_syslog_pam_error(handle, LOG_ERR, PAM_SERVICE_ERR, "User name not set.");
+        }
+
+        /* Possibly split out the area name */
+        _cleanup_free_ char *username_without_area = NULL, *area = NULL;
+        const char *carea = strrchr(username, '%');
+        if (carea && (filename_is_valid(carea + 1) || isempty(carea + 1))) {
+                username_without_area = strndup(username, carea - username);
+                if (!username_without_area)
+                        return pam_log_oom(handle);
+
+                username = username_without_area;
+                area = strdup(carea + 1);
+                if (!area)
+                        return pam_log_oom(handle);
         }
 
         /* Let's bypass all IPC complexity for the two user names we know for sure we don't manage, and for
@@ -240,6 +256,14 @@ static int acquire_user_record(
                                                     "Failed to set PAM user record data '%s': @PAMERR@", generic_field);
 
                 TAKE_PTR(json_copy);
+        }
+
+        /* Let's store the area we parsed out of the name in an env var, so that pam_systemd later can honour it. */
+        if (area) {
+                r = pam_misc_setenv(handle, "XDG_AREA", area, /* readonly= */ 0);
+                if (r != PAM_SUCCESS)
+                        return pam_syslog_pam_error(handle, LOG_ERR, r,
+                                                    "Failed to set environment variable $XDG_AREA to '%s': @PAMERR@", area);
         }
 
         if (ret_record)
@@ -529,24 +553,24 @@ static int acquire_home(
 
         /* This acquires a reference to a home directory in the following ways:
          *
-         * 1. If please_authenticate is false, it tries to call RefHome() first — which
-         *    will get us a reference to the home without authentication (which will work for homes that are
-         *    not encrypted, or that already are activated). If this works, we are done. Yay!
+         * 1. If ACQUIRE_MUST_AUTHENTICATE is not set, it tries to call RefHome() first — which will get us a
+         *    reference to the home without authentication (which will work for homes that are not encrypted,
+         *    or that already are activated). If this works, we are done. Yay!
          *
          * 2. Otherwise, we'll call AcquireHome() — which will try to activate the home getting us a
          *    reference. If this works, we are done. Yay!
          *
-         * 3. if ref_anyway, we'll call RefHomeUnrestricted() — which will give us a reference in any case
-         *    (even if the activation failed!).
+         * 3. if ACQUIRE_REF_ANYWAY is set, we'll call RefHomeUnrestricted() — which will give us a reference
+         *    in any case (even if the activation failed!).
          *
-         * The idea is that please_authenticate is set to false for the PAM session hooks (since for those
-         * authentication doesn't matter), and true for the PAM authentication hooks (since for those
-         * authentication is essential). And ref_anyway should be set if we are pretty sure that we can later
-         * activate the home directory via our fallback shell logic, and hence are OK if we can't activate
-         * things here. Usecase for that are SSH logins where SSH does the authentication and thus only the
-         * session hooks are called. But from the session hooks SSH doesn't allow asking questions, hence we
-         * simply allow the login attempt to continue but then invoke our fallback shell that will prompt the
-         * user for the missing unlock credentials, and then chainload the real shell.
+         * The idea is that ACQUIRE_MUST_AUTHENTICATE is off for the PAM session hooks (since for those
+         * authentication doesn't matter), and on for the PAM authentication hooks (since for those
+         * authentication is essential). And ACQUIRE_REF_ANYWAY should be set if we are pretty sure that we
+         * can later activate the home directory via our fallback shell logic, and hence are OK if we can't
+         * activate things here. Usecase for that are SSH logins where SSH does the authentication and thus
+         * only the session hooks are called. But from the session hooks SSH doesn't allow asking questions,
+         * hence we simply allow the login attempt to continue but then invoke our fallback shell that will
+         * prompt the user for the missing unlock credentials, and then chainload the real shell.
          */
 
         r = pam_get_user(handle, &username, NULL);

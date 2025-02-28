@@ -994,6 +994,142 @@ assert_cc(__NR_pkey_mprotect == systemd_NR_pkey_mprotect);
 #  endif
 #endif
 
+#ifndef __IGNORE_quotactl_fd
+#  if defined(__aarch64__)
+#    define systemd_NR_quotactl_fd 443
+#  elif defined(__alpha__)
+#    define systemd_NR_quotactl_fd 553
+#  elif defined(__arc__) || defined(__tilegx__)
+#    define systemd_NR_quotactl_fd 443
+#  elif defined(__arm__)
+#    define systemd_NR_quotactl_fd 443
+#  elif defined(__i386__)
+#    define systemd_NR_quotactl_fd 443
+#  elif defined(__ia64__)
+#    define systemd_NR_quotactl_fd 1467
+#  elif defined(__loongarch_lp64)
+#    define systemd_NR_quotactl_fd 443
+#  elif defined(__m68k__)
+#    define systemd_NR_quotactl_fd 443
+#  elif defined(_MIPS_SIM)
+#    if _MIPS_SIM == _MIPS_SIM_ABI32
+#      define systemd_NR_quotactl_fd 4443
+#    elif _MIPS_SIM == _MIPS_SIM_NABI32
+#      define systemd_NR_quotactl_fd 6443
+#    elif _MIPS_SIM == _MIPS_SIM_ABI64
+#      define systemd_NR_quotactl_fd 5443
+#    else
+#      error "Unknown MIPS ABI"
+#    endif
+#  elif defined(__hppa__)
+#    define systemd_NR_quotactl_fd 443
+#  elif defined(__powerpc__)
+#    define systemd_NR_quotactl_fd 443
+#  elif defined(__riscv)
+#    if __riscv_xlen == 32
+#      define systemd_NR_quotactl_fd 443
+#    elif __riscv_xlen == 64
+#      define systemd_NR_quotactl_fd 443
+#    else
+#      error "Unknown RISC-V ABI"
+#    endif
+#  elif defined(__s390__)
+#    define systemd_NR_quotactl_fd 443
+#  elif defined(__sparc__)
+#    define systemd_NR_quotactl_fd 443
+#  elif defined(__x86_64__)
+#    if defined(__ILP32__)
+#      define systemd_NR_quotactl_fd (443 | /* __X32_SYSCALL_BIT */ 0x40000000)
+#    else
+#      define systemd_NR_quotactl_fd 443
+#    endif
+#  elif !defined(missing_arch_template)
+#    warning "quotactl_fd() syscall number is unknown for your architecture"
+#  endif
+
+/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
+#  if defined __NR_quotactl_fd && __NR_quotactl_fd >= 0
+#    if defined systemd_NR_quotactl_fd
+assert_cc(__NR_quotactl_fd == systemd_NR_quotactl_fd);
+#    endif
+#  else
+#    if defined __NR_quotactl_fd
+#      undef __NR_quotactl_fd
+#    endif
+#    if defined systemd_NR_quotactl_fd && systemd_NR_quotactl_fd >= 0
+#      define __NR_quotactl_fd systemd_NR_quotactl_fd
+#    endif
+#  endif
+#endif
+
+#ifndef __IGNORE_removexattrat
+#  if defined(__aarch64__)
+#    define systemd_NR_removexattrat 466
+#  elif defined(__alpha__)
+#    define systemd_NR_removexattrat 576
+#  elif defined(__arc__) || defined(__tilegx__)
+#    define systemd_NR_removexattrat 466
+#  elif defined(__arm__)
+#    define systemd_NR_removexattrat 466
+#  elif defined(__i386__)
+#    define systemd_NR_removexattrat 466
+#  elif defined(__ia64__)
+#    define systemd_NR_removexattrat -1
+#  elif defined(__loongarch_lp64)
+#    define systemd_NR_removexattrat 466
+#  elif defined(__m68k__)
+#    define systemd_NR_removexattrat 466
+#  elif defined(_MIPS_SIM)
+#    if _MIPS_SIM == _MIPS_SIM_ABI32
+#      define systemd_NR_removexattrat 4466
+#    elif _MIPS_SIM == _MIPS_SIM_NABI32
+#      define systemd_NR_removexattrat 6466
+#    elif _MIPS_SIM == _MIPS_SIM_ABI64
+#      define systemd_NR_removexattrat 5466
+#    else
+#      error "Unknown MIPS ABI"
+#    endif
+#  elif defined(__hppa__)
+#    define systemd_NR_removexattrat 466
+#  elif defined(__powerpc__)
+#    define systemd_NR_removexattrat 466
+#  elif defined(__riscv)
+#    if __riscv_xlen == 32
+#      define systemd_NR_removexattrat 466
+#    elif __riscv_xlen == 64
+#      define systemd_NR_removexattrat 466
+#    else
+#      error "Unknown RISC-V ABI"
+#    endif
+#  elif defined(__s390__)
+#    define systemd_NR_removexattrat 466
+#  elif defined(__sparc__)
+#    define systemd_NR_removexattrat 466
+#  elif defined(__x86_64__)
+#    if defined(__ILP32__)
+#      define systemd_NR_removexattrat (466 | /* __X32_SYSCALL_BIT */ 0x40000000)
+#    else
+#      define systemd_NR_removexattrat 466
+#    endif
+#  elif !defined(missing_arch_template)
+#    warning "removexattrat() syscall number is unknown for your architecture"
+#  endif
+
+/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
+#  if defined __NR_removexattrat && __NR_removexattrat >= 0
+#    if defined systemd_NR_removexattrat
+assert_cc(__NR_removexattrat == systemd_NR_removexattrat);
+#    endif
+#  else
+#    if defined __NR_removexattrat
+#      undef __NR_removexattrat
+#    endif
+#    if defined systemd_NR_removexattrat && systemd_NR_removexattrat >= 0
+#      define __NR_removexattrat systemd_NR_removexattrat
+#    endif
+#  endif
+#endif
+
 #ifndef __IGNORE_renameat2
 #  if defined(__aarch64__)
 #    define systemd_NR_renameat2 276
@@ -1130,138 +1266,70 @@ assert_cc(__NR_setns == systemd_NR_setns);
 #  endif
 #endif
 
-#ifndef __IGNORE_statx
+#ifndef __IGNORE_setxattrat
 #  if defined(__aarch64__)
-#    define systemd_NR_statx 291
+#    define systemd_NR_setxattrat 463
 #  elif defined(__alpha__)
-#    define systemd_NR_statx 522
+#    define systemd_NR_setxattrat 573
 #  elif defined(__arc__) || defined(__tilegx__)
-#    define systemd_NR_statx 291
+#    define systemd_NR_setxattrat 463
 #  elif defined(__arm__)
-#    define systemd_NR_statx 397
+#    define systemd_NR_setxattrat 463
 #  elif defined(__i386__)
-#    define systemd_NR_statx 383
+#    define systemd_NR_setxattrat 463
 #  elif defined(__ia64__)
-#    define systemd_NR_statx 1350
+#    define systemd_NR_setxattrat -1
 #  elif defined(__loongarch_lp64)
-#    define systemd_NR_statx 291
+#    define systemd_NR_setxattrat 463
 #  elif defined(__m68k__)
-#    define systemd_NR_statx 379
+#    define systemd_NR_setxattrat 463
 #  elif defined(_MIPS_SIM)
 #    if _MIPS_SIM == _MIPS_SIM_ABI32
-#      define systemd_NR_statx 4366
+#      define systemd_NR_setxattrat 4463
 #    elif _MIPS_SIM == _MIPS_SIM_NABI32
-#      define systemd_NR_statx 6330
+#      define systemd_NR_setxattrat 6463
 #    elif _MIPS_SIM == _MIPS_SIM_ABI64
-#      define systemd_NR_statx 5326
+#      define systemd_NR_setxattrat 5463
 #    else
 #      error "Unknown MIPS ABI"
 #    endif
 #  elif defined(__hppa__)
-#    define systemd_NR_statx 349
+#    define systemd_NR_setxattrat 463
 #  elif defined(__powerpc__)
-#    define systemd_NR_statx 383
+#    define systemd_NR_setxattrat 463
 #  elif defined(__riscv)
 #    if __riscv_xlen == 32
-#      define systemd_NR_statx 291
+#      define systemd_NR_setxattrat 463
 #    elif __riscv_xlen == 64
-#      define systemd_NR_statx 291
+#      define systemd_NR_setxattrat 463
 #    else
 #      error "Unknown RISC-V ABI"
 #    endif
 #  elif defined(__s390__)
-#    define systemd_NR_statx 379
+#    define systemd_NR_setxattrat 463
 #  elif defined(__sparc__)
-#    define systemd_NR_statx 360
+#    define systemd_NR_setxattrat 463
 #  elif defined(__x86_64__)
 #    if defined(__ILP32__)
-#      define systemd_NR_statx (332 | /* __X32_SYSCALL_BIT */ 0x40000000)
+#      define systemd_NR_setxattrat (463 | /* __X32_SYSCALL_BIT */ 0x40000000)
 #    else
-#      define systemd_NR_statx 332
+#      define systemd_NR_setxattrat 463
 #    endif
 #  elif !defined(missing_arch_template)
-#    warning "statx() syscall number is unknown for your architecture"
+#    warning "setxattrat() syscall number is unknown for your architecture"
 #  endif
 
 /* may be an (invalid) negative number due to libseccomp, see PR 13319 */
-#  if defined __NR_statx && __NR_statx >= 0
-#    if defined systemd_NR_statx
-assert_cc(__NR_statx == systemd_NR_statx);
+#  if defined __NR_setxattrat && __NR_setxattrat >= 0
+#    if defined systemd_NR_setxattrat
+assert_cc(__NR_setxattrat == systemd_NR_setxattrat);
 #    endif
 #  else
-#    if defined __NR_statx
-#      undef __NR_statx
+#    if defined __NR_setxattrat
+#      undef __NR_setxattrat
 #    endif
-#    if defined systemd_NR_statx && systemd_NR_statx >= 0
-#      define __NR_statx systemd_NR_statx
-#    endif
-#  endif
-#endif
-
-#ifndef __IGNORE_quotactl_fd
-#  if defined(__aarch64__)
-#    define systemd_NR_quotactl_fd 443
-#  elif defined(__alpha__)
-#    define systemd_NR_quotactl_fd 553
-#  elif defined(__arc__) || defined(__tilegx__)
-#    define systemd_NR_quotactl_fd 443
-#  elif defined(__arm__)
-#    define systemd_NR_quotactl_fd 443
-#  elif defined(__i386__)
-#    define systemd_NR_quotactl_fd 443
-#  elif defined(__ia64__)
-#    define systemd_NR_quotactl_fd 1467
-#  elif defined(__loongarch_lp64)
-#    define systemd_NR_quotactl_fd 443
-#  elif defined(__m68k__)
-#    define systemd_NR_quotactl_fd 443
-#  elif defined(_MIPS_SIM)
-#    if _MIPS_SIM == _MIPS_SIM_ABI32
-#      define systemd_NR_quotactl_fd 4443
-#    elif _MIPS_SIM == _MIPS_SIM_NABI32
-#      define systemd_NR_quotactl_fd 6443
-#    elif _MIPS_SIM == _MIPS_SIM_ABI64
-#      define systemd_NR_quotactl_fd 5443
-#    else
-#      error "Unknown MIPS ABI"
-#    endif
-#  elif defined(__hppa__)
-#    define systemd_NR_quotactl_fd 443
-#  elif defined(__powerpc__)
-#    define systemd_NR_quotactl_fd 443
-#  elif defined(__riscv)
-#    if __riscv_xlen == 32
-#      define systemd_NR_quotactl_fd 443
-#    elif __riscv_xlen == 64
-#      define systemd_NR_quotactl_fd 443
-#    else
-#      error "Unknown RISC-V ABI"
-#    endif
-#  elif defined(__s390__)
-#    define systemd_NR_quotactl_fd 443
-#  elif defined(__sparc__)
-#    define systemd_NR_quotactl_fd 443
-#  elif defined(__x86_64__)
-#    if defined(__ILP32__)
-#      define systemd_NR_quotactl_fd (443 | /* __X32_SYSCALL_BIT */ 0x40000000)
-#    else
-#      define systemd_NR_quotactl_fd 443
-#    endif
-#  elif !defined(missing_arch_template)
-#    warning "quotactl_fd() syscall number is unknown for your architecture"
-#  endif
-
-/* may be an (invalid) negative number due to libseccomp, see PR 13319 */
-#  if defined __NR_quotactl_fd && __NR_quotactl_fd >= 0
-#    if defined systemd_NR_quotactl_fd
-assert_cc(__NR_quotactl_fd == systemd_NR_quotactl_fd);
-#    endif
-#  else
-#    if defined __NR_quotactl_fd
-#      undef __NR_quotactl_fd
-#    endif
-#    if defined systemd_NR_quotactl_fd && systemd_NR_quotactl_fd >= 0
-#      define __NR_quotactl_fd systemd_NR_quotactl_fd
+#    if defined systemd_NR_setxattrat && systemd_NR_setxattrat >= 0
+#      define __NR_setxattrat systemd_NR_setxattrat
 #    endif
 #  endif
 #endif

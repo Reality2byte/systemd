@@ -233,6 +233,7 @@ if shellprofiledir == ''
         shellprofiledir = sysconfdir / 'profile.d'
 endif
 conf.set10('LINK_SHELL_EXTRA_DROPIN', shellprofiledir != 'no' and not shellprofiledir.startswith('/usr/'))
+conf.set10('LINK_OSC_CONTEXT_DROPIN', shellprofiledir != 'no' and not shellprofiledir.startswith('/usr/'))
 conf.set('SHELLPROFILEDIR', shellprofiledir, description : 'shell profile directory')
 
 memory_accounting_default = get_option('memory-accounting-default')
@@ -568,14 +569,12 @@ decl_headers = '''
 #include <dirent.h>
 #include <sched.h>
 #include <sys/mount.h>
-#include <sys/stat.h>
 #include <uchar.h>
 '''
 
 foreach decl : ['char16_t',
                 'char32_t',
                 'struct mount_attr',
-                'struct statx',
                 'struct dirent64',
                 'struct sched_attr',
                ]
@@ -594,21 +593,9 @@ foreach decl : ['char16_t',
                 endif
         endif
 
-        if decl == 'struct statx'
-                if have
-                        want_linux_stat_h = false
-                else
-                        have = cc.sizeof(decl,
-                                         prefix : decl_headers + '#include <linux/stat.h>',
-                                         args : '-D_GNU_SOURCE') > 0
-                        want_linux_stat_h = have
-                endif
-        endif
-
         conf.set10('HAVE_' + decl.underscorify().to_upper(), have)
 endforeach
 
-conf.set10('WANT_LINUX_STAT_H', want_linux_stat_h)
 conf.set10('WANT_LINUX_FS_H', want_linux_fs_h)
 
 foreach ident : ['secure_getenv', '__secure_getenv']
@@ -625,7 +612,7 @@ foreach ident : [
                                  #include <unistd.h>'''],     # no known header declares pivot_root
         ['ioprio_get',        '''#include <sched.h>'''],      # no known header declares ioprio_get
         ['ioprio_set',        '''#include <sched.h>'''],      # no known header declares ioprio_set
-        ['sched_setattr',     '''#include <sched.h>'''],      # no known header declares sched_setattr
+        ['sched_setattr',     '''#include <sched.h>'''],
         ['name_to_handle_at', '''#include <sys/types.h>
                                  #include <sys/stat.h>
                                  #include <fcntl.h>'''],
@@ -638,9 +625,6 @@ foreach ident : [
         ['copy_file_range',   '''#include <sys/syscall.h>
                                  #include <unistd.h>'''],
         ['bpf',               '''#include <sys/syscall.h>
-                                 #include <unistd.h>'''],
-        ['statx',             '''#include <sys/types.h>
-                                 #include <sys/stat.h>
                                  #include <unistd.h>'''],
         ['explicit_bzero' ,   '''#include <string.h>'''],
         ['reallocarray',      '''#include <stdlib.h>'''],
@@ -682,6 +666,8 @@ foreach ident : [
         ['strerrorname_np',   '''#include <string.h>'''],
         ['getrandom',         '''#include <sys/random.h>'''],
         ['quotactl_fd',       '''#include <sys/quota.h>'''],
+        ['setxattrat',        '''#include <sys/xattr.h>'''],  # no known header declares setxattrat
+        ['removexattrat',     '''#include <sys/xattr.h>'''],  # no known header declares removexattrat
 ]
 
         have = cc.has_function(ident[0], prefix : ident[1], args : '-D_GNU_SOURCE')
@@ -690,17 +676,20 @@ endforeach
 
 #####################################################################
 
-sh = find_program('sh')
-echo = find_program('echo')
-sed = find_program('sed')
 awk = find_program('awk')
-stat = find_program('stat')
-ln = find_program('ln')
-git = find_program('git', required : false)
-env = find_program('env')
-rsync = find_program('rsync', required : false)
 diff = find_program('diff')
+echo = find_program('echo')
+env = find_program('env')
 find = find_program('find')
+getent = find_program('getent', required : false)
+git = find_program('git', required : false)
+gperf = find_program('gperf')
+id = find_program('id', required : false)
+ln = find_program('ln')
+rsync = find_program('rsync', required : false)
+sed = find_program('sed')
+sh = find_program('sh')
+stat = find_program('stat')
 
 ln_s = ln.full_path() + ' -frsT -- "${DESTDIR:-}@0@" "${DESTDIR:-}@1@"'
 
@@ -738,8 +727,6 @@ endif
 
 #####################################################################
 
-gperf = find_program('gperf')
-
 gperf_test_format = '''
 #include <string.h>
 const char* in_word_set(const char *, @0@);
@@ -769,7 +756,6 @@ if not cc.has_header('sys/capability.h')
 endif
 foreach header : ['crypt.h',
                   'linux/ioprio.h',
-                  'linux/time_types.h',
                   'sys/sdt.h',
                   'threads.h',
                   'valgrind/memcheck.h',
@@ -889,41 +875,49 @@ nobody_user = get_option('nobody-user')
 nobody_group = get_option('nobody-group')
 
 if not meson.is_cross_build()
-        getent_result = run_command('getent', 'passwd', '65534', check : false)
-        if getent_result.returncode() == 0
-                name = getent_result.stdout().split(':')[0]
-                if name != nobody_user
-                        warning('\n' +
-                                'The local user with the UID 65534 does not match the configured user name "@0@" of the nobody user (its name is @1@).\n'.format(nobody_user, name) +
-                                'Your build will result in an user table setup that is incompatible with the local system.')
+        if getent.found()
+                ret = run_command(getent, 'passwd', '65534', check : false)
+                if ret.returncode() == 0
+                        name = ret.stdout().split(':')[0]
+                        if name != nobody_user
+                                warning('\n' +
+                                        'The local user with the UID 65534 does not match the configured user name "@0@" of the nobody user (its name is @1@).\n'.format(nobody_user, name) +
+                                        'Your build will result in an user table setup that is incompatible with the local system.')
+                        endif
                 endif
         endif
-        id_result = run_command('id', '-u', nobody_user, check : false)
-        if id_result.returncode() == 0
-                id = id_result.stdout().strip().to_int()
-                if id != 65534
-                        warning('\n' +
-                                'The local user with the configured user name "@0@" of the nobody user does not have UID 65534 (it has @1@).\n'.format(nobody_user, id) +
-                                'Your build will result in an user table setup that is incompatible with the local system.')
+        if id.found()
+                ret = run_command(id, '-u', nobody_user, check : false)
+                if ret.returncode() == 0
+                        uid = ret.stdout().strip().to_int()
+                        if uid != 65534
+                                warning('\n' +
+                                        'The local user with the configured user name "@0@" of the nobody user does not have UID 65534 (it has @1@).\n'.format(nobody_user, uid) +
+                                        'Your build will result in an user table setup that is incompatible with the local system.')
+                        endif
                 endif
         endif
 
-        getent_result = run_command('getent', 'group', '65534', check : false)
-        if getent_result.returncode() == 0
-                name = getent_result.stdout().split(':')[0]
-                if name != nobody_group
-                        warning('\n' +
-                                'The local group with the GID 65534 does not match the configured group name "@0@" of the nobody group (its name is @1@).\n'.format(nobody_group, name) +
-                                'Your build will result in an group table setup that is incompatible with the local system.')
+        if getent.found()
+                ret = run_command(getent, 'group', '65534', check : false)
+                if ret.returncode() == 0
+                        name = ret.stdout().split(':')[0]
+                        if name != nobody_group
+                                warning('\n' +
+                                        'The local group with the GID 65534 does not match the configured group name "@0@" of the nobody group (its name is @1@).\n'.format(nobody_group, name) +
+                                        'Your build will result in an group table setup that is incompatible with the local system.')
+                        endif
                 endif
         endif
-        id_result = run_command('id', '-g', nobody_group, check : false)
-        if id_result.returncode() == 0
-                id = id_result.stdout().strip().to_int()
-                if id != 65534
-                        warning('\n' +
-                                'The local group with the configured group name "@0@" of the nobody group does not have GID 65534 (it has @1@).\n'.format(nobody_group, id) +
-                                'Your build will result in an group table setup that is incompatible with the local system.')
+        if id.found()
+                ret = run_command(id, '-g', nobody_group, check : false)
+                if ret.returncode() == 0
+                        gid = ret.stdout().strip().to_int()
+                        if gid != 65534
+                                warning('\n' +
+                                        'The local group with the configured group name "@0@" of the nobody group does not have GID 65534 (it has @1@).\n'.format(nobody_group, gid) +
+                                        'Your build will result in an group table setup that is incompatible with the local system.')
+                        endif
                 endif
         endif
 endif
@@ -1210,6 +1204,7 @@ libapparmor = dependency('libapparmor',
                          version : '>= 2.13',
                          required : get_option('apparmor'))
 conf.set10('HAVE_APPARMOR', libapparmor.found())
+libapparmor_cflags = libapparmor.partial_dependency(includes: true, compile_args: true)
 
 have = get_option('smack') and get_option('smack-run-label') != ''
 conf.set10('HAVE_SMACK_RUN_LABEL', have)

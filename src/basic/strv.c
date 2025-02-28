@@ -1063,6 +1063,23 @@ int fputstrv(FILE *f, char * const *l, const char *separator, bool *space) {
         return 0;
 }
 
+void string_strv_hashmap_remove(Hashmap *h, const char *key, const char *value) {
+        assert(key);
+
+        if (value) {
+                char **l = hashmap_get(h, key);
+                if (!l)
+                        return;
+
+                strv_remove(l, value);
+                if (!strv_isempty(l))
+                        return;
+        }
+
+        _unused_ _cleanup_free_ char *key_free = NULL;
+        strv_free(hashmap_remove2(h, key, (void**) &key_free));
+}
+
 static int string_strv_hashmap_put_internal(Hashmap *h, const char *key, const char *value) {
         char **l;
         int r;
@@ -1220,4 +1237,25 @@ int strv_rebreak_lines(char **l, size_t width, char ***ret) {
 
         *ret = TAKE_PTR(broken);
         return 0;
+}
+
+char** strv_filter_prefix(char * const *l, const char *prefix) {
+
+        /* Allocates a copy of 'l', but only copies over entries starting with 'prefix' */
+
+        if (isempty(prefix))
+                return strv_copy(l);
+
+        _cleanup_strv_free_ char **f = NULL;
+        size_t sz = 0;
+
+        STRV_FOREACH(i, l) {
+                if (!startswith(*i, prefix))
+                        continue;
+
+                if (strv_extend_with_size(&f, &sz, *i) < 0)
+                        return NULL;
+        }
+
+        return TAKE_PTR(f);
 }

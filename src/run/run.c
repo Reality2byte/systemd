@@ -31,6 +31,7 @@
 #include "fs-util.h"
 #include "hostname-util.h"
 #include "main-func.h"
+#include "osc-context.h"
 #include "parse-argument.h"
 #include "parse-util.h"
 #include "path-util.h"
@@ -91,6 +92,7 @@ static char *arg_background = NULL;
 static sd_json_format_flags_t arg_json_format_flags = SD_JSON_FORMAT_OFF;
 static char *arg_shell_prompt_prefix = NULL;
 static int arg_lightweight = -1;
+static char *arg_area = NULL;
 
 STATIC_DESTRUCTOR_REGISTER(arg_description, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_environment, strv_freep);
@@ -103,6 +105,7 @@ STATIC_DESTRUCTOR_REGISTER(arg_cmdline, strv_freep);
 STATIC_DESTRUCTOR_REGISTER(arg_exec_path, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_background, freep);
 STATIC_DESTRUCTOR_REGISTER(arg_shell_prompt_prefix, freep);
+STATIC_DESTRUCTOR_REGISTER(arg_area, freep);
 
 static int help(void) {
         _cleanup_free_ char *link = NULL;
@@ -206,6 +209,7 @@ static int help_sudo_mode(void) {
                "     --shell-prompt-prefix=PREFIX Set $SHELL_PROMPT_PREFIX\n"
                "     --lightweight=BOOLEAN        Control whether to register a session with service manager\n"
                "                                  or without\n"
+               "  -a --area=AREA                  Home area to log into\n"
                "\nSee the %s for details.\n",
                program_invocation_short_name,
                ansi_highlight(),
@@ -824,6 +828,7 @@ static int parse_argv_sudo_mode(int argc, char *argv[]) {
                 { "pipe",                no_argument,       NULL, ARG_PIPE                },
                 { "shell-prompt-prefix", required_argument, NULL, ARG_SHELL_PROMPT_PREFIX },
                 { "lightweight",         required_argument, NULL, ARG_LIGHTWEIGHT         },
+                { "area",                required_argument, NULL, 'a'                     },
                 {},
         };
 
@@ -835,7 +840,7 @@ static int parse_argv_sudo_mode(int argc, char *argv[]) {
         /* Resetting to 0 forces the invocation of an internal initialization routine of getopt_long()
          * that checks for GNU extensions in optstring ('-' or '+' at the beginning). */
         optind = 0;
-        while ((c = getopt_long(argc, argv, "+hVu:g:D:", options, NULL)) >= 0)
+        while ((c = getopt_long(argc, argv, "+hVu:g:D:a:", options, NULL)) >= 0)
 
                 switch (c) {
 
@@ -942,12 +947,31 @@ static int parse_argv_sudo_mode(int argc, char *argv[]) {
                                 return r;
                         break;
 
+                case 'a':
+                        /* We allow an empty --area= specification to allow logging into the primary home directory */
+                        if (!isempty(optarg) && !filename_is_valid(optarg))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Invalid area name, refusing: %s", optarg);
+
+                        r = free_and_strdup_warn(&arg_area, optarg);
+                        if (r < 0)
+                                return r;
+
+                        break;
+
                 case '?':
                         return -EINVAL;
 
                 default:
                         assert_not_reached();
                 }
+
+        if (!arg_exec_user && arg_area) {
+                /* If the user specifies --area= but not --user= then consider this an area switch request,
+                 * and default to logging into our own account */
+                arg_exec_user = getusername_malloc();
+                if (!arg_exec_user)
+                        return log_oom();
+        }
 
         if (!arg_working_directory) {
                 if (arg_exec_user) {
@@ -1075,26 +1099,39 @@ static int parse_argv_sudo_mode(int argc, char *argv[]) {
                         return log_error_errno(r, "Failed to set $SHELL_PROMPT_PREFIX environment variable: %m");
         }
 
-        /* When using run0 to acquire privileges temporarily, let's not pull in session manager by
-         * default. Note that pam_logind/systemd-logind doesn't distinguish between run0-style privilege
-         * escalation on a TTY and first class (getty-style) TTY logins (and thus gives root a per-session
-         * manager for interactive TTY sessions), hence let's override the logic explicitly here. We only do
-         * this for root though, under the assumption that if a regular user temporarily transitions into
-         * another regular user it's a better default that the full user environment is uniformly
-         * available. */
-        if (arg_lightweight < 0 && !strv_env_get(arg_environment, "XDG_SESSION_CLASS") && privileged_execution())
-                arg_lightweight = true;
+        if (!strv_env_get(arg_environment, "XDG_SESSION_CLASS")) {
 
-        if (arg_lightweight >= 0) {
-                const char *class =
-                        arg_lightweight ? (arg_stdio == ARG_STDIO_PTY ? (privileged_execution() ? "user-early-light" : "user-light") : "background-light") :
-                                          (arg_stdio == ARG_STDIO_PTY ? (privileged_execution() ? "user-early" : "user") : "background");
+                /* If logging into an area, imply lightweight mode */
+                if (arg_lightweight < 0 && !isempty(arg_area))
+                        arg_lightweight = true;
 
-                log_debug("Setting XDG_SESSION_CLASS to '%s'.", class);
+                /* When using run0 to acquire privileges temporarily, let's not pull in session manager by
+                 * default. Note that pam_logind/systemd-logind doesn't distinguish between run0-style privilege
+                 * escalation on a TTY and first class (getty-style) TTY logins (and thus gives root a per-session
+                 * manager for interactive TTY sessions), hence let's override the logic explicitly here. We only do
+                 * this for root though, under the assumption that if a regular user temporarily transitions into
+                 * another regular user it's a better default that the full user environment is uniformly
+                 * available. */
+                if (arg_lightweight < 0 && privileged_execution())
+                        arg_lightweight = true;
 
-                r = strv_env_assign(&arg_environment, "XDG_SESSION_CLASS", class);
+                if (arg_lightweight >= 0) {
+                        const char *class =
+                                arg_lightweight ? (arg_stdio == ARG_STDIO_PTY ? (privileged_execution() ? "user-early-light" : "user-light") : "background-light") :
+                                                  (arg_stdio == ARG_STDIO_PTY ? (privileged_execution() ? "user-early" : "user") : "background");
+
+                        log_debug("Setting XDG_SESSION_CLASS to '%s'.", class);
+
+                        r = strv_env_assign(&arg_environment, "XDG_SESSION_CLASS", class);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to set $XDG_SESSION_CLASS environment variable: %m");
+                }
+        }
+
+        if (arg_area) {
+                r = strv_env_assign(&arg_environment, "XDG_AREA", arg_area);
                 if (r < 0)
-                        return log_error_errno(r, "Failed to set $XDG_SESSION_CLASS environment variable: %m");
+                        return log_error_errno(r, "Failed to set $XDG_AREA environment variable: %m");
         }
 
         return 1;
@@ -1196,7 +1233,7 @@ static int transient_kill_set_properties(sd_bus_message *m) {
 }
 
 static int transient_service_set_properties(sd_bus_message *m, const char *pty_path, int pty_fd) {
-        bool send_term = false;
+        int send_term = false; /* tri-state */
         int r;
 
         /* We disable environment expansion on the server side via ExecStartEx=:.
@@ -1275,14 +1312,22 @@ static int transient_service_set_properties(sd_bus_message *m, const char *pty_p
                 if (r < 0)
                         return bus_log_create_error(r);
 
-                send_term = isatty_safe(STDIN_FILENO) || isatty_safe(STDOUT_FILENO) || isatty_safe(STDERR_FILENO);
+                send_term = -1;
         }
 
-        if (send_term) {
+        if (send_term != 0) {
                 const char *e;
 
-                e = getenv("TERM");
-                if (e) {
+                /* Propagate $TERM only if we are actually connected to a TTY  */
+                if (isatty_safe(STDIN_FILENO) || isatty_safe(STDOUT_FILENO) || isatty_safe(STDERR_FILENO)) {
+                        e = getenv("TERM");
+                        send_term = true;
+                } else
+                        /* If we are not connected to any TTY ourselves, then send TERM=dumb, but only if we
+                         * really need to (because we actually allocated a TTY for the service) */
+                        e = "dumb";
+
+                if (send_term > 0) {
                         _cleanup_free_ char *n = NULL;
 
                         n = strjoin("TERM=", e);
@@ -2158,7 +2203,14 @@ static int start_transient_service(sd_bus *bus) {
                 if (!c.bus_path)
                         return log_oom();
 
+                _cleanup_(osc_context_closep) sd_id128_t osc_context_id = SD_ID128_NULL;
                 if (pty_fd >= 0) {
+                        if (!terminal_is_dumb() && arg_exec_user) {
+                                r = osc_context_open_chpriv(arg_exec_user, /* ret_seq= */ NULL, &osc_context_id);
+                                if (r < 0)
+                                        return r;
+                        }
+
                         (void) sd_event_set_signal_exit(c.event, true);
 
                         if (!arg_quiet)

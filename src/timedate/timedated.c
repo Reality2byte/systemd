@@ -877,18 +877,22 @@ static int method_set_time(sd_bus_message *m, void *userdata, sd_bus_error *erro
                 return sd_bus_reply_method_return(m, NULL);
 
         if (relative) {
-                usec_t n, x;
-
-                n = now(CLOCK_REALTIME);
-                x = n + utc;
-
-                if ((utc > 0 && x < n) ||
-                    (utc < 0 && x > n))
+                usec_t n = now(CLOCK_REALTIME);
+                bool valid;
+                if (utc > 0)
+                        valid = INC_SAFE(&n, (usec_t) utc);
+                else
+                        valid = DEC_SAFE(&n, (usec_t) -utc);
+                if (!valid)
                         return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Time value overflow");
 
-                timespec_store(&ts, x);
+                timespec_store(&ts, n);
         } else
                 timespec_store(&ts, (usec_t) utc);
+
+        /* refuse the request when the time is before systemd build date time*/
+        if (ts.tv_sec < TIME_EPOCH)
+                return sd_bus_error_set(error, SD_BUS_ERROR_INVALID_ARGS, "Requested to set the clock to time before build time, refusing.");
 
         r = bus_verify_polkit_async_full(
                         m,
@@ -909,7 +913,7 @@ static int method_set_time(sd_bus_message *m, void *userdata, sd_bus_error *erro
         if (r < 0 && r != -ENODATA)
                 return r;
 
-        timespec_store(&ts, timespec_load(&ts) + (now(CLOCK_MONOTONIC) - start));
+        timespec_store(&ts, timespec_load(&ts) + usec_sub_unsigned(now(CLOCK_MONOTONIC), start));
 
         /* Set system clock */
         if (clock_settime(CLOCK_REALTIME, &ts) < 0) {

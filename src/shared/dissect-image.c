@@ -1002,6 +1002,8 @@ static int dissect_image(
                         type = gpt_partition_type_from_uuid(type_id);
 
                         label = blkid_partition_get_name(pp); /* libblkid returns NULL here if empty */
+                        if (streq_ptr(label, "_empty"))
+                                continue;
 
                         log_debug("Dissecting %s partition with label %s and UUID %s",
                                   strna(partition_designator_to_string(type.designator)), strna(label), SD_ID128_TO_UUID_STRING(id));
@@ -3172,6 +3174,33 @@ void verity_settings_done(VeritySettings *v) {
         v->data_path = mfree(v->data_path);
 }
 
+VeritySettings* verity_settings_free(VeritySettings *v) {
+        if (!v)
+                return NULL;
+
+        verity_settings_done(v);
+        return mfree(v);
+}
+
+void verity_settings_hash_func(const VeritySettings *s, struct siphash *state) {
+        assert(s);
+
+        siphash24_compress_typesafe(s->root_hash_size, state);
+        siphash24_compress(s->root_hash, s->root_hash_size, state);
+}
+
+int verity_settings_compare_func(const VeritySettings *x, const VeritySettings *y) {
+        int r;
+
+        r = CMP(x->root_hash_size, y->root_hash_size);
+        if (r != 0)
+                return r;
+
+        return memcmp(x->root_hash, y->root_hash, x->root_hash_size);
+}
+
+DEFINE_HASH_OPS_WITH_VALUE_DESTRUCTOR(verity_settings_hash_ops, VeritySettings, verity_settings_hash_func, verity_settings_compare_func, VeritySettings, verity_settings_free);
+
 int verity_settings_load(
                 VeritySettings *verity,
                 const char *image,
@@ -3433,7 +3462,7 @@ int dissected_image_load_verity_sig_partition(
                 a = hexmem(root_hash, root_hash_size);
                 b = hexmem(verity->root_hash, verity->root_hash_size);
 
-                return log_debug_errno(r, "Root hash in signature JSON data (%s) doesn't match configured hash (%s).", strna(a), strna(b));
+                return log_debug_errno(SYNTHETIC_ERRNO(EINVAL), "Root hash in signature JSON data (%s) doesn't match configured hash (%s).", strna(a), strna(b));
         }
 
         sig = sd_json_variant_by_key(v, "signature");

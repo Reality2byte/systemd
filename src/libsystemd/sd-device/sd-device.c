@@ -1445,6 +1445,26 @@ _public_ int sd_device_get_sysnum(sd_device *device, const char **ret) {
         return 0;
 }
 
+int device_get_sysnum_unsigned(sd_device *device, unsigned *ret) {
+        int r;
+
+        assert(device);
+
+        const char *s;
+        r = sd_device_get_sysnum(device, &s);
+        if (r < 0)
+                return r;
+
+        unsigned n;
+        r = safe_atou_full(s, SAFE_ATO_REFUSE_PLUS_MINUS | SAFE_ATO_REFUSE_LEADING_WHITESPACE | 10, &n);
+        if (r < 0)
+                return r;
+
+        if (ret)
+                *ret = n;
+        return 0;
+}
+
 _public_ int sd_device_get_action(sd_device *device, sd_device_action_t *ret) {
         assert_return(device, -EINVAL);
 
@@ -2672,16 +2692,7 @@ _public_ int sd_device_set_sysattr_valuef(sd_device *device, const char *sysattr
 }
 
 _public_ int sd_device_trigger(sd_device *device, sd_device_action_t action) {
-        const char *s;
-
-        assert_return(device, -EINVAL);
-
-        s = device_action_to_string(action);
-        if (!s)
-                return -EINVAL;
-
-        /* This uses the simple no-UUID interface of kernel < 4.13 */
-        return sd_device_set_sysattr_value(device, "uevent", s);
+        return sd_device_trigger_with_uuid(device, action, NULL);
 }
 
 _public_ int sd_device_trigger_with_uuid(
@@ -2694,10 +2705,6 @@ _public_ int sd_device_trigger_with_uuid(
         int r;
 
         assert_return(device, -EINVAL);
-
-        /* If no one wants to know the UUID, use the simple interface from pre-4.13 times */
-        if (!ret_uuid)
-                return sd_device_trigger(device, action);
 
         s = device_action_to_string(action);
         if (!s)
@@ -2713,7 +2720,8 @@ _public_ int sd_device_trigger_with_uuid(
         if (r < 0)
                 return r;
 
-        *ret_uuid = u;
+        if (ret_uuid)
+                *ret_uuid = u;
         return 0;
 }
 

@@ -21,9 +21,10 @@ SYSCALLS = [
     'pidfd_send_signal',
     'pkey_mprotect',
     'quotactl_fd',
+    'removexattrat',
     'renameat2',
     'setns',
-    'statx',
+    'setxattrat',
 ]
 
 def dictify(f):

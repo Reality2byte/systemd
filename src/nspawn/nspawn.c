@@ -68,6 +68,7 @@
 #include "mount-util.h"
 #include "mountpoint-util.h"
 #include "namespace-util.h"
+#include "notify-recv.h"
 #include "nspawn-bind-user.h"
 #include "nspawn-cgroup.h"
 #include "nspawn-expose-ports.h"
@@ -84,6 +85,7 @@
 #include "nsresource.h"
 #include "nulstr-util.h"
 #include "os-util.h"
+#include "osc-context.h"
 #include "pager.h"
 #include "parse-argument.h"
 #include "parse-util.h"
@@ -471,11 +473,7 @@ static int help(void) {
 }
 
 static int custom_mount_check_all(void) {
-        size_t i;
-
-        for (i = 0; i < arg_n_custom_mounts; i++) {
-                CustomMount *m = &arg_custom_mounts[i];
-
+        FOREACH_ARRAY(m, arg_custom_mounts, arg_n_custom_mounts)
                 if (path_equal(m->destination, "/") && arg_userns_mode != USER_NAMESPACE_NO) {
                         if (arg_userns_ownership != USER_NAMESPACE_OWNERSHIP_OFF)
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
@@ -485,7 +483,6 @@ static int custom_mount_check_all(void) {
                                 return log_error_errno(SYNTHETIC_ERRNO(EINVAL),
                                                        "--private-users with automatic UID shift may not be combined with custom root mounts.");
                 }
-        }
 
         return 0;
 }
@@ -2175,85 +2172,6 @@ static int setup_boot_id(void) {
         return mount_nofollow_verbose(LOG_ERR, NULL, to, NULL, MS_BIND|MS_REMOUNT|MS_RDONLY|MS_NOSUID|MS_NOEXEC|MS_NODEV, NULL);
 }
 
-static int get_fuse_version(uint32_t *ret_major, uint32_t *ret_minor) {
-        /* Must be called with mount privileges, either via arg_privileged or by being uid=0 in new
-         * CLONE_NEWUSER/CLONE_NEWNS namespaces. This is true when called from outer_child(). */
-        ssize_t n;
-        _cleanup_close_ int fuse_fd = -EBADF, mnt_fd = -EBADF;
-        _cleanup_free_ char *opts = NULL;
-        union {
-                char unstructured[FUSE_MIN_READ_BUFFER];
-                struct {
-                        struct fuse_in_header header;
-                        /* Don't use <linux/fuse.h>:`struct fuse_init_in` because a newer fuse.h might give
-                         * us a bigger struct than what an older kernel actually gives us, and that would
-                         * break our .header.len check. */
-                        struct {
-                                uint32_t major;
-                                uint32_t minor;
-                        } body;
-                } structured;
-        } request;
-
-        assert(ret_major);
-        assert(ret_minor);
-
-        /* Get a FUSE handle. */
-        fuse_fd = open("/dev/fuse", O_CLOEXEC|O_RDWR);
-        if (fuse_fd < 0)
-                return log_debug_errno(errno, "Failed to open /dev/fuse: %m");
-        if (asprintf(&opts, "fd=%i,rootmode=40000,user_id=0,group_id=0", fuse_fd) < 0)
-                return log_oom_debug();
-        mnt_fd = make_fsmount(LOG_DEBUG, "nspawn-fuse", "fuse.nspawn", 0, opts, -EBADF);
-        if (mnt_fd < 0)
-                return mnt_fd;
-
-        /* Read a request from the FUSE handle. */
-        n = read(fuse_fd, &request.unstructured, sizeof request);
-        if (n < 0)
-                return log_debug_errno(errno, "Failed to read /dev/fuse: %m");
-        if ((size_t) n < sizeof request.structured.header ||
-            (size_t) n < request.structured.header.len)
-                return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Failed to read /dev/fuse: Short read");
-
-        /* Assume that the request is a FUSE_INIT request, and return the version information from it. */
-        if (request.structured.header.opcode != FUSE_INIT)
-                return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Initial request from /dev/fuse should have opcode=%i (FUSE_INIT), but has opcode=%"PRIu32,
-                                       FUSE_INIT, request.structured.header.opcode);
-        if (request.structured.header.len < sizeof request.structured)
-                return log_debug_errno(SYNTHETIC_ERRNO(EIO), "Initial FUSE_INIT request from /dev/fuse is too short");
-        *ret_major = request.structured.body.major;
-        *ret_minor = request.structured.body.minor;
-        return 0;
-}
-
-static bool should_enable_fuse(void) {
-        uint32_t fuse_major, fuse_minor;
-        int r;
-
-        r = get_fuse_version(&fuse_major, &fuse_minor);
-        if (r < 0) {
-                if (ERRNO_IS_NEG_DEVICE_ABSENT(r))
-                        log_debug_errno(r, "Disabling FUSE: FUSE appears to be disabled on the host: %m");
-                else if (ERRNO_IS_NEG_NOT_SUPPORTED(r))
-                        log_debug_errno(r, "Disabling FUSE: Kernel does not support the fsopen() family of syscalls: %m");
-                else
-                        log_full_errno(ERRNO_IS_NEG_PRIVILEGE(r) ? LOG_DEBUG : LOG_WARNING, r,
-                                       "Disabling FUSE: Failed to determine FUSE version: %m");
-                return false;
-        }
-
-        /* FUSE is only userns-safe in FUSE version 7.27 and later.
-         * https://github.com/torvalds/linux/commit/da315f6e03988a7127680bbc26e1028991b899b8 */
-        if (fuse_major < 7 || (fuse_major == 7 && fuse_minor < 27)) {
-                log_debug("Disabling FUSE: FUSE version %" PRIu32 ".%" PRIu32 " is too old to support user namespaces",
-                          fuse_major, fuse_minor);
-                return false;
-        }
-
-        return true;
-}
-
 static int bind_mount_devnode(const char *from, const char *to) {
         int r;
 
@@ -2273,7 +2191,7 @@ static int bind_mount_devnode(const char *from, const char *to) {
         return 0;
 }
 
-static int copy_devnode_one(const char *dest, const char *node, bool ignore_mknod_failure) {
+static int copy_devnode_one(const char *dest, const char *node, bool check) {
         int r;
 
         assert(dest);
@@ -2284,6 +2202,19 @@ static int copy_devnode_one(const char *dest, const char *node, bool ignore_mkno
         _cleanup_free_ char *from = path_join("/dev/", node);
         if (!from)
                 return log_oom();
+
+        if (check) {
+                /* If 'check' is true, create /dev/fuse only when it is accessible. The check is necessary,
+                 * as some custom service units that invoke systemd-nspawn may enable DevicePolicy= without
+                 * DeviceAllow= for the device node. */
+                _cleanup_close_ int fd = open(from, O_CLOEXEC|O_RDWR);
+                if (fd < 0) {
+                        log_debug_errno(errno,
+                                        "Failed to open %s, skipping creation of the device node in the container, ignoring: %m",
+                                        from);
+                        return 0;
+                }
+        }
 
         _cleanup_free_ char *to = path_join(dest, from);
         if (!to)
@@ -2319,10 +2250,6 @@ static int copy_devnode_one(const char *dest, const char *node, bool ignore_mkno
                 /* If arg_uid_shift != 0, then we cannot fall back to use bind mount. */
                 if (!(arg_userns_mode == USER_NAMESPACE_NO ||
                       (arg_userns_mode == USER_NAMESPACE_FIXED && arg_uid_shift == 0))) {
-                        if (ignore_mknod_failure) {
-                                log_debug_errno(r, "Failed to mknod(%s), ignoring: %m", to);
-                                return 0;
-                        }
 
                         if (arg_userns_mode != USER_NAMESPACE_MANAGED || !ERRNO_IS_NEG_PRIVILEGE(r))
                                 return log_error_errno(r, "Failed to mknod(%s): %m", to);
@@ -2331,14 +2258,9 @@ static int copy_devnode_one(const char *dest, const char *node, bool ignore_mkno
                 }
 
                 /* Some systems abusively restrict mknod but allow bind mounts. */
-                if (bind_mount_devnode(from, to) < 0) {
+                if (bind_mount_devnode(from, to) < 0)
                         /* use the original error code. */
-                        if (ignore_mknod_failure) {
-                                log_debug_errno(r, "Both mknod() and bind mount %s failed, ignoring: %m", to);
-                                return 0;
-                        }
                         return log_error_errno(r, "Both mknod() and bind mount %s failed: %m", to);
-                }
         } else {
                 /* mknod() succeeds, chown() it if necessary. */
                 r = userns_lchown(to, 0, 0);
@@ -2372,29 +2294,24 @@ static int copy_devnode_one(const char *dest, const char *node, bool ignore_mkno
         return 0;
 }
 
-static int copy_devnodes(const char *dest, bool enable_fuse) {
+static int copy_devnodes(const char *dest) {
         int r = 0;
 
         assert(dest);
 
+        /* Required basic device nodes. */
         FOREACH_STRING(node, "null", "zero", "full", "random", "urandom", "tty") {
-                r = copy_devnode_one(dest, node, /* ignore_mknod_failure = */ false);
+                r = copy_devnode_one(dest, node, /* check = */ false);
                 if (r < 0)
                         return r;
         }
 
-        if (enable_fuse) {
-                r = copy_devnode_one(dest, "fuse", /* ignore_mknod_failure = */ false);
+        /* Optional device nodes. */
+        FOREACH_STRING(node, "fuse", "net/tun") {
+                r = copy_devnode_one(dest, node, /* check = */ true);
                 if (r < 0)
                         return r;
         }
-
-        /* We unconditionally try to create /dev/net/tun, but let's ignore failure if --private-network is
-         * unspecified. The failure can be triggered when e.g. DevicePolicy= is set, but DeviceAllow= does
-         * not contains the device node, and --private-users=pick is specified. */
-        r = copy_devnode_one(dest, "net/tun", /* ignore_mknod_failure = */ !arg_private_network);
-        if (r < 0)
-                return r;
 
         return 0;
 }
@@ -3665,9 +3582,9 @@ static int inner_child(
         /* LXC sets container=lxc, so follow the scheme here */
         envp[n_env++] = strjoina("container=", arg_container_service_name);
 
-        envp[n_env] = strv_find_prefix(environ, "TERM=");
-        if (envp[n_env])
-                n_env++;
+        /* Propagate $TERM unless we are invoked in pipe mode and stdin/stdout/stderr don't refer to a TTY */
+        const char *term = (arg_console_mode != CONSOLE_PIPE || on_tty()) ? strv_find_prefix(environ, "TERM=") : NULL;
+        envp[n_env++] = (char*) (term ?: "TERM=dumb");
 
         if (home || !uid_is_valid(arg_uid) || arg_uid == 0)
                 if (asprintf(envp + n_env++, "HOME=%s", home ?: "/root") < 0)
@@ -3836,7 +3753,11 @@ static int setup_notify_child(const void *directory) {
 
         r = setsockopt_int(fd, SOL_SOCKET, SO_PASSCRED, true);
         if (r < 0)
-                return log_error_errno(r, "SO_PASSCRED failed: %m");
+                return log_error_errno(r, "Failed to enable SO_PASSCRED: %m");
+
+        r = setsockopt_int(fd, SOL_SOCKET, SO_PASSPIDFD, true);
+        if (r < 0)
+                log_debug_errno(r, "Failed to enable SO_PASSPIDFD, ignoring: %m");
 
         return TAKE_FD(fd);
 }
@@ -3975,7 +3896,7 @@ static int outer_child(
 
         _cleanup_(bind_user_context_freep) BindUserContext *bind_user_context = NULL;
         _cleanup_strv_free_ char **os_release_pairs = NULL;
-        bool idmap = false, enable_fuse;
+        bool idmap = false;
         const char *p;
         pid_t pid;
         ssize_t l;
@@ -4154,12 +4075,12 @@ static int outer_child(
                 /* Send the user maps we determined to the parent, so that it installs it in our user
                  * namespace UID map table */
 
-                for (size_t i = 0; i < bind_user_context->n_data; i++)  {
+                FOREACH_ARRAY(d, bind_user_context->data, bind_user_context->n_data) {
                         uid_t map[] = {
-                                bind_user_context->data[i].payload_user->uid,
-                                bind_user_context->data[i].host_user->uid,
-                                (uid_t) bind_user_context->data[i].payload_group->gid,
-                                (uid_t) bind_user_context->data[i].host_group->gid,
+                                d->payload_user->uid,
+                                d->host_user->uid,
+                                (uid_t) d->payload_group->gid,
+                                (uid_t) d->host_group->gid,
                         };
 
                         l = send(fd_outer_socket, map, sizeof(map), MSG_NOSIGNAL);
@@ -4319,12 +4240,7 @@ static int outer_child(
         if (r < 0)
                 return r;
 
-        enable_fuse = should_enable_fuse();
-        l = send(fd_outer_socket, &enable_fuse, sizeof enable_fuse, 0);
-        if (l < 0)
-                return log_error_errno(errno, "Failed to send whether to enable FUSE: %m");
-
-        r = copy_devnodes(directory, enable_fuse);
+        r = copy_devnodes(directory);
         if (r < 0)
                 return r;
 
@@ -4700,61 +4616,23 @@ static int setup_uid_map(
 }
 
 static int nspawn_dispatch_notify_fd(sd_event_source *source, int fd, uint32_t revents, void *userdata) {
-        char buf[NOTIFY_BUFFER_MAX+1];
-        char *p = NULL;
-        struct iovec iovec = {
-                .iov_base = buf,
-                .iov_len = sizeof(buf)-1,
-        };
-        CMSG_BUFFER_TYPE(CMSG_SPACE(sizeof(struct ucred)) +
-                         CMSG_SPACE(sizeof(int) * NOTIFY_FD_MAX)) control;
-        struct msghdr msghdr = {
-                .msg_iov = &iovec,
-                .msg_iovlen = 1,
-                .msg_control = &control,
-                .msg_controllen = sizeof(control),
-        };
-        struct ucred *ucred;
-        ssize_t n;
-        pid_t inner_child_pid;
-        _cleanup_strv_free_ char **tags = NULL;
+        pid_t inner_child_pid = PTR_TO_PID(userdata);
         int r;
 
         assert(userdata);
 
-        inner_child_pid = PTR_TO_PID(userdata);
-
-        if (revents != EPOLLIN) {
-                log_warning("Got unexpected poll event for notify fd.");
+        _cleanup_(pidref_done) PidRef sender_pid = PIDREF_NULL;
+        _cleanup_strv_free_ char **tags = NULL;
+        r = notify_recv_strv(fd, &tags, /* ret_ucred= */ NULL, &sender_pid);
+        if (r == -EAGAIN)
                 return 0;
-        }
+        if (r < 0)
+                return r;
 
-        n = recvmsg_safe(fd, &msghdr, MSG_DONTWAIT|MSG_CMSG_CLOEXEC);
-        if (ERRNO_IS_NEG_TRANSIENT(n))
-                return 0;
-        if (n == -ECHRNG) {
-                log_warning_errno(n, "Got message with truncated control data (too many fds sent?), ignoring.");
-                return 0;
-        }
-        if (n == -EXFULL) {
-                log_warning_errno(n, "Got message with truncated payload data, ignoring.");
-                return 0;
-        }
-        if (n < 0)
-                return log_warning_errno(n, "Couldn't read notification socket: %m");
-
-        cmsg_close_all(&msghdr);
-
-        ucred = CMSG_FIND_DATA(&msghdr, SOL_SOCKET, SCM_CREDENTIALS, struct ucred);
-        if (!ucred || ucred->pid != inner_child_pid) {
+        if (sender_pid.pid != inner_child_pid) {
                 log_debug("Received notify message from process that is not the payload's PID 1. Ignoring.");
                 return 0;
         }
-
-        buf[n] = 0;
-        tags = strv_split(buf, "\n\r");
-        if (!tags)
-                return log_oom();
 
         if (DEBUG_LOGGING) {
                 _cleanup_free_ char *joined = strv_join(tags, " ");
@@ -4773,7 +4651,7 @@ static int nspawn_dispatch_notify_fd(sd_event_source *source, int fd, uint32_t r
                         log_warning_errno(r, "Failed to send readiness notification, ignoring: %m");
         }
 
-        p = strv_find_startswith(tags, "STATUS=");
+        char *p = strv_find_startswith(tags, "STATUS=");
         if (p)
                 (void) sd_notifyf(false, "STATUS=Container running: %s", p);
 
@@ -5280,7 +5158,6 @@ static int run_container(
         ssize_t l;
         sigset_t mask_chld;
         _cleanup_close_ int child_netns_fd = -EBADF;
-        bool enable_fuse;
 
         assert_se(sigemptyset(&mask_chld) == 0);
         assert_se(sigaddset(&mask_chld, SIGCHLD) == 0);
@@ -5464,12 +5341,6 @@ static int run_container(
                                                l, l == 0 ? " The child is most likely dead." : "");
         }
 
-        l = recv(fd_outer_socket_pair[0], &enable_fuse, sizeof enable_fuse, 0);
-        if (l < 0)
-                return log_error_errno(errno, "Failed to read whether to enable FUSE: %m");
-        if (l != sizeof enable_fuse)
-                return log_error_errno(SYNTHETIC_ERRNO(EIO), "Short read while reading whether to enable FUSE.");
-
         /* Wait for the outer child. */
         r = wait_for_terminate_and_check("(sd-namespace)", *pid, WAIT_LOG_ABNORMAL);
         if (r < 0)
@@ -5624,7 +5495,6 @@ static int run_container(
         if (arg_register) {
                 RegisterMachineFlags flags = 0;
                 SET_FLAG(flags, REGISTER_MACHINE_KEEP_UNIT, arg_keep_unit);
-                SET_FLAG(flags, REGISTER_MACHINE_ENABLE_FUSE, enable_fuse);
                 r = register_machine(
                                 bus,
                                 arg_machine,
@@ -5645,7 +5515,6 @@ static int run_container(
 
         } else if (!arg_keep_unit) {
                 AllocateScopeFlags flags = ALLOCATE_SCOPE_ALLOW_PIDFD;
-                SET_FLAG(flags, ALLOCATE_SCOPE_ENABLE_FUSE, enable_fuse);
                 r = allocate_scope(
                                 bus,
                                 arg_machine,
@@ -5771,6 +5640,13 @@ static int run_container(
 
                 (void) expose_port_execute(rtnl, &expose_args->fw_ctx, arg_expose_ports, AF_INET, &expose_args->address4);
                 (void) expose_port_execute(rtnl, &expose_args->fw_ctx, arg_expose_ports, AF_INET6, &expose_args->address6);
+        }
+
+        _cleanup_(osc_context_closep) sd_id128_t osc_context_id = SD_ID128_NULL;
+        if (IN_SET(arg_console_mode, CONSOLE_INTERACTIVE, CONSOLE_READ_ONLY) && !terminal_is_dumb()) {
+                r = osc_context_open_container(arg_machine, /* ret_seq= */ NULL, &osc_context_id);
+                if (r < 0)
+                        return r;
         }
 
         if (arg_console_mode != CONSOLE_PIPE) {

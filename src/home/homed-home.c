@@ -12,6 +12,7 @@
 #include "env-util.h"
 #include "errno-list.h"
 #include "errno-util.h"
+#include "event-util.h"
 #include "fd-util.h"
 #include "fileio.h"
 #include "filesystems.h"
@@ -153,6 +154,7 @@ int home_new(Manager *m, UserRecord *hr, const char *sysfs, Home **ret) {
                 .aliases = TAKE_PTR(aliases),
                 .uid = hr->uid,
                 .state = _HOME_STATE_INVALID,
+                .worker_pid = PIDREF_NULL,
                 .worker_stdout_fd = -EBADF,
                 .sysfs = TAKE_PTR(ns),
                 .signed_locally = -1,
@@ -224,8 +226,8 @@ Home *home_free(Home *h) {
                 if (h->sysfs)
                         (void) hashmap_remove_value(h->manager->homes_by_sysfs, h->sysfs, h);
 
-                if (h->worker_pid > 0)
-                        (void) hashmap_remove_value(h->manager->homes_by_worker_pid, PID_TO_PTR(h->worker_pid), h);
+                if (pidref_is_set(&h->worker_pid))
+                        (void) hashmap_remove_value(h->manager->homes_by_worker_pid, &h->worker_pid, h);
 
                 if (h->manager->gc_focus == h)
                         h->manager->gc_focus = NULL;
@@ -236,6 +238,7 @@ Home *home_free(Home *h) {
         user_record_unref(h->record);
         user_record_unref(h->secret);
 
+        pidref_done_sigkill_wait(&h->worker_pid);
         h->worker_event_source = sd_event_source_disable_unref(h->worker_event_source);
         safe_close(h->worker_stdout_fd);
         free(h->user_name);
@@ -549,7 +552,6 @@ static int home_parse_worker_stdout(int _fd, UserRecord **ret) {
         _cleanup_close_ int fd = _fd; /* take possession, even on failure */
         _cleanup_(user_record_unrefp) UserRecord *hr = NULL;
         _cleanup_fclose_ FILE *f = NULL;
-        unsigned line, column;
         struct stat st;
         int r;
 
@@ -581,6 +583,7 @@ static int home_parse_worker_stdout(int _fd, UserRecord **ret) {
                 rewind(f);
         }
 
+        unsigned line = 0, column = 0;
         r = sd_json_parse_file(f, "stdout", SD_JSON_PARSE_SENSITIVE, &v, &line, &column);
         if (r < 0)
                 return log_error_errno(r, "Failed to parse identity at %u:%u: %m", line, column);
@@ -689,6 +692,8 @@ static int convert_worker_errno(Home *h, int e, sd_bus_error *error) {
                 return sd_bus_error_setf(error, BUS_ERROR_HOME_CANT_AUTHENTICATE, "Home %s has no password or other authentication mechanism defined.", h->user_name);
         case -EADDRINUSE:
                 return sd_bus_error_setf(error, BUS_ERROR_HOME_IN_USE, "Home %s is currently being used elsewhere.", h->user_name);
+        case -ENETUNREACH:
+                return sd_bus_error_setf(error, BUS_ERROR_HOME_ABSENT, "Backing storage for %s currently absent.", h->user_name);
         }
 
         return 0;
@@ -1135,13 +1140,13 @@ static int home_on_worker_process(sd_event_source *s, const siginfo_t *si, void 
         assert(s);
         assert(si);
 
-        assert(h->worker_pid == si->si_pid);
+        assert(h->worker_pid.pid == si->si_pid);
         assert(h->worker_event_source);
         assert(h->worker_stdout_fd >= 0);
 
-        (void) hashmap_remove_value(h->manager->homes_by_worker_pid, PID_TO_PTR(h->worker_pid), h);
+        (void) hashmap_remove_value(h->manager->homes_by_worker_pid, &h->worker_pid, h);
 
-        h->worker_pid = 0;
+        pidref_done(&h->worker_pid);
         h->worker_event_source = sd_event_source_disable_unref(h->worker_event_source);
 
         if (si->si_code != CLD_EXITED) {
@@ -1225,14 +1230,13 @@ static int home_start_work(
         _cleanup_(erase_and_freep) char *formatted = NULL;
         _cleanup_close_ int stdin_fd = -EBADF, stdout_fd = -EBADF;
         _cleanup_free_ int *blob_fds = NULL;
-        pid_t pid = 0;
         int r;
 
         assert(h);
         assert(verb);
         assert(hr);
 
-        if (h->worker_pid != 0)
+        if (pidref_is_set(&h->worker_pid))
                 return -EBUSY;
 
         assert(h->worker_stdout_fd < 0);
@@ -1297,7 +1301,8 @@ static int home_start_work(
         if (stdout_fd < 0)
                 return stdout_fd;
 
-        r = safe_fork_full("(sd-homework)",
+        _cleanup_(pidref_done_sigkill_wait) PidRef pid = PIDREF_NULL;
+        r = pidref_safe_fork_full("(sd-homework)",
                            (int[]) { stdin_fd, stdout_fd, STDERR_FILENO },
                            blob_fds, hashmap_size(blobs),
                            FORK_RESET_SIGNALS|FORK_CLOSE_ALL_FDS|FORK_CLOEXEC_OFF|FORK_PACK_FDS|FORK_DEATHSIG_SIGTERM|
@@ -1360,20 +1365,21 @@ static int home_start_work(
                 _exit(EXIT_FAILURE);
         }
 
-        r = sd_event_add_child(h->manager->event, &h->worker_event_source, pid, WEXITED, home_on_worker_process, h);
+        r = event_add_child_pidref(h->manager->event, &h->worker_event_source, &pid, WEXITED, home_on_worker_process, h);
         if (r < 0)
                 return r;
 
         (void) sd_event_source_set_description(h->worker_event_source, "worker");
 
-        r = hashmap_put(h->manager->homes_by_worker_pid, PID_TO_PTR(pid), h);
+        h->worker_pid = TAKE_PIDREF(pid);
+        r = hashmap_put(h->manager->homes_by_worker_pid, &h->worker_pid, h);
         if (r < 0) {
+                pidref_done_sigkill_wait(&h->worker_pid);
                 h->worker_event_source = sd_event_source_disable_unref(h->worker_event_source);
                 return r;
         }
 
         h->worker_stdout_fd = TAKE_FD(stdout_fd);
-        h->worker_pid = pid;
         h->worker_error_code = 0;
 
         return 0;
@@ -3276,19 +3282,19 @@ int home_wait_for_worker(Home *h) {
 
         assert(h);
 
-        if (h->worker_pid <= 0)
+        if (!pidref_is_set(&h->worker_pid))
                 return 0;
 
         log_info("Worker process for home %s is still running while exiting. Waiting for it to finish.", h->user_name);
 
-        r = wait_for_terminate_with_timeout(h->worker_pid, 30 * USEC_PER_SEC);
+        r = wait_for_terminate_with_timeout(h->worker_pid.pid, 30 * USEC_PER_SEC);
         if (r == -ETIMEDOUT)
                 log_warning_errno(r, "Waiting for worker process for home %s timed out. Ignoring.", h->user_name);
         else if (r < 0)
                 log_warning_errno(r, "Failed to wait for worker process for home %s. Ignoring.", h->user_name);
 
-        (void) hashmap_remove_value(h->manager->homes_by_worker_pid, PID_TO_PTR(h->worker_pid), h);
-        h->worker_pid = 0;
+        (void) hashmap_remove_value(h->manager->homes_by_worker_pid, &h->worker_pid, h);
+        pidref_done(&h->worker_pid);
         return 1;
 }
 

@@ -194,9 +194,9 @@ def get_zboot_kernel(f: IO[bytes]) -> bytes:
         raise NotImplementedError('lzo decompression not implemented')
     elif comp_type.startswith(b'xzkern'):
         raise NotImplementedError('xzkern decompression not implemented')
-    elif comp_type.startswith(b'zstd22'):
-        zstd = try_import('zstd')
-        return cast(bytes, zstd.uncompress(f.read(size)))
+    elif comp_type.startswith(b'zstd'):
+        zstd = try_import('zstandard')
+        return cast(bytes, zstd.ZstdDecompressor().stream_reader(f.read(size)).read())
 
     raise NotImplementedError(f'unknown compressed type: {comp_type!r}')
 
@@ -226,15 +226,15 @@ def maybe_decompress(filename: Union[str, Path]) -> bytes:
         return cast(bytes, gzip.open(f).read())
 
     if start.startswith(b'\x28\xb5\x2f\xfd'):
-        zstd = try_import('zstd')
-        return cast(bytes, zstd.uncompress(f.read()))
+        zstd = try_import('zstandard')
+        return cast(bytes, zstd.ZstdDecompressor().stream_reader(f.read()).read())
 
     if start.startswith(b'\x02\x21\x4c\x18'):
         lz4 = try_import('lz4.frame', 'lz4')
         return cast(bytes, lz4.frame.decompress(f.read()))
 
     if start.startswith(b'\x04\x22\x4d\x18'):
-        print('Newer lz4 stream format detected! This may not boot!')
+        print('Newer lz4 stream format detected! This may not boot!', file=sys.stderr)
         lz4 = try_import('lz4.frame', 'lz4')
         return cast(bytes, lz4.frame.decompress(f.read()))
 
@@ -274,10 +274,13 @@ class UkifyConfig:
     pcr_banks: list[str]
     pcr_private_keys: list[str]
     pcr_public_keys: list[str]
+    pcr_certificates: list[str]
     pcrpkey: Optional[Path]
+    pcrsig: Union[str, Path, None]
+    join_pcrsig: Optional[Path]
     phase_path_groups: Optional[list[str]]
     policy_digest: bool
-    profile: Union[str, Path, None]
+    profile: Optional[str]
     sb_cert: Union[str, Path, None]
     sb_cert_name: Optional[str]
     sb_cert_validity: int
@@ -380,7 +383,7 @@ class Uname:
                 print(f'Found uname version: {version}', file=sys.stderr)
                 return version
             except ValueError as e:
-                print(str(e))
+                print(str(e), file=sys.stderr)
         return None
 
 
@@ -681,7 +684,7 @@ def check_cert_and_keys_nonexistent(opts: UkifyConfig) -> None:
     # Raise if any of the keys and certs are found on disk
     paths: Iterator[Union[str, Path, None]] = itertools.chain(
         (opts.sb_key, opts.sb_cert),
-        *((priv_key, pub_key) for priv_key, pub_key, _ in key_path_groups(opts)),
+        *((priv_key, pub_key, cert) for priv_key, pub_key, cert, _ in key_path_groups(opts)),
     )
     for path in paths:
         if path and Path(path).exists():
@@ -719,17 +722,19 @@ def combine_signatures(pcrsigs: list[dict[str, str]]) -> str:
     return json.dumps(combined)
 
 
-def key_path_groups(opts: UkifyConfig) -> Iterator[tuple[str, Optional[str], Optional[str]]]:
+def key_path_groups(opts: UkifyConfig) -> Iterator[tuple[str, Optional[str], Optional[str], Optional[str]]]:
     if not opts.pcr_private_keys:
         return
 
     n_priv = len(opts.pcr_private_keys)
     pub_keys = opts.pcr_public_keys or []
+    certs = opts.pcr_certificates or []
     pp_groups = opts.phase_path_groups or []
 
     yield from itertools.zip_longest(
         opts.pcr_private_keys,
         pub_keys[:n_priv],
+        certs[:n_priv],
         pp_groups[:n_priv],
         fillvalue=None,
     )
@@ -743,12 +748,13 @@ def pe_section_size(section: pefile.SectionStructure) -> int:
     return cast(int, min(section.Misc_VirtualSize, section.SizeOfRawData))
 
 
-def call_systemd_measure(uki: UKI, opts: UkifyConfig, profile_start: int = 0) -> None:
+def call_systemd_measure(uki: UKI, opts: UkifyConfig, profile_start: int = 0) -> str:
     measure_tool = find_tool(
         'systemd-measure',
         '/usr/lib/systemd/systemd-measure',
         opts=opts,
     )
+    combined = ''
 
     banks = opts.pcr_banks or ()
 
@@ -784,6 +790,7 @@ def call_systemd_measure(uki: UKI, opts: UkifyConfig, profile_start: int = 0) ->
             unique_to_measure[section.name] = section
 
     if opts.measure or opts.policy_digest:
+        pcrsigs = []
         to_measure = unique_to_measure.copy()
 
         for dtbauto in dtbauto_to_measure:
@@ -805,12 +812,33 @@ def call_systemd_measure(uki: UKI, opts: UkifyConfig, profile_start: int = 0) ->
             ]
 
             # The JSON object will be used for offline signing, include the public key
-            # so that the fingerprint is included too.
-            if opts.policy_digest and opts.pcr_public_keys:
-                cmd += [f'--public-key={opts.pcr_public_keys[0]}']
+            # so that the fingerprint is included too. In case a certificate is passed, use the
+            # right parameter so that systemd-measure can extract the public key from it.
+            if opts.policy_digest:
+                if opts.pcr_public_keys:
+                    cmd += ['--public-key', opts.pcr_public_keys[0]]
+                elif opts.pcr_certificates:
+                    cmd += ['--certificate', opts.pcr_certificates[0]]
+                    if opts.certificate_provider:
+                        cmd += ['--certificate-source', f'provider:{opts.certificate_provider}']
 
             print('+', shell_join(cmd), file=sys.stderr)
-            subprocess.check_call(cmd)
+            output = subprocess.check_output(cmd, text=True)  # type: ignore
+
+            if opts.policy_digest:
+                pcrsig = json.loads(output)
+                pcrsigs += [pcrsig]
+            else:
+                print(output)
+
+        if opts.policy_digest:
+            combined = combine_signatures(pcrsigs)
+            # We need to ensure the section has space for signatures, that will be added separately later,
+            # so add some whitespace to pad the section. At most we'll need 4kb per digest (rsa4096).
+            # We might even check the key type given we have it to know the precise length, but don't
+            # bother for now.
+            combined += ' ' * 1024 * combined.count('"pol":')
+            uki.add_section(Section.create('.pcrsig', combined))
 
     # PCR signing
 
@@ -829,16 +857,24 @@ def call_systemd_measure(uki: UKI, opts: UkifyConfig, profile_start: int = 0) ->
                 *(f'--bank={bank}' for bank in banks),
             ]
 
-            for priv_key, pub_key, group in key_path_groups(opts):
+            for priv_key, pub_key, cert, group in key_path_groups(opts):
                 extra = [f'--private-key={priv_key}']
                 if opts.signing_engine is not None:
-                    assert pub_key
-                    extra += [f'--private-key-source=engine:{opts.signing_engine}']
-                    extra += [f'--certificate={pub_key}']
+                    assert pub_key or cert
+                    # Backward compatibility, we used to pass the public key as the certificate
+                    # as there was no --pcr-certificate= parameter
+                    extra += [
+                        f'--private-key-source=engine:{opts.signing_engine}',
+                        f'--certificate={pub_key or cert}',
+                    ]
                 elif opts.signing_provider is not None:
-                    assert pub_key
-                    extra += [f'--private-key-source=provider:{opts.signing_provider}']
-                    extra += [f'--certificate={pub_key}']
+                    assert pub_key or cert
+                    extra += [
+                        f'--private-key-source=provider:{opts.signing_provider}',
+                        f'--certificate={pub_key or cert}',
+                    ]
+                elif cert:
+                    extra += [f'--certificate={cert}']
                 elif pub_key:
                     extra += [f'--public-key={pub_key}']
 
@@ -848,12 +884,14 @@ def call_systemd_measure(uki: UKI, opts: UkifyConfig, profile_start: int = 0) ->
                 extra += [f'--phase={phase_path}' for phase_path in group or ()]
 
                 print('+', shell_join(cmd + extra), file=sys.stderr)  # type: ignore
-                pcrsig = subprocess.check_output(cmd + extra, text=True)  # type: ignore
-                pcrsig = json.loads(pcrsig)
+                output = subprocess.check_output(cmd + extra, text=True)  # type: ignore
+                pcrsig = json.loads(output)
                 pcrsigs += [pcrsig]
 
         combined = combine_signatures(pcrsigs)
         uki.add_section(Section.create('.pcrsig', combined))
+
+    return combined
 
 
 def join_initrds(initrds: list[Path]) -> Union[Path, bytes, None]:
@@ -885,7 +923,7 @@ class PEError(Exception):
     pass
 
 
-def pe_add_sections(uki: UKI, output: str) -> None:
+def pe_add_sections(opts: UkifyConfig, uki: UKI, output: str) -> None:
     pe = pefile.PE(uki.executable, fast_load=True)
 
     # Old stubs do not have the symbol/string table stripped, even though image files should not have one.
@@ -932,14 +970,24 @@ def pe_add_sections(uki: UKI, output: str) -> None:
     )
     pe = pefile.PE(data=pe.write(), fast_load=True)
 
+    # pefile has an hardcoded limit of 256MB, which is not enough when building an initrd with large firmware
+    # files and all kernel modules. See: https://github.com/erocarrera/pefile/issues/396
     warnings = pe.get_warnings()
-    if warnings:
+    for w in warnings:
+        if 'VirtualSize is extremely large' in w:
+            continue
+        if 'VirtualAddress is beyond' in w:
+            continue
         raise PEError(f'pefile warnings treated as errors: {warnings}')
 
-    security = pe.OPTIONAL_HEADER.DATA_DIRECTORY[pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']]
-    if security.VirtualAddress != 0:
-        # We could strip the signatures, but why would anyone sign the stub?
-        raise PEError('Stub image is signed, refusing.')
+    # When attaching signatures we are operating on an existing UKI which might be signed
+    if not opts.pcrsig:
+        security = pe.OPTIONAL_HEADER.DATA_DIRECTORY[
+            pefile.DIRECTORY_ENTRY['IMAGE_DIRECTORY_ENTRY_SECURITY']
+        ]
+        if security.VirtualAddress != 0:
+            # We could strip the signatures, but why would anyone sign the stub?
+            raise PEError('Stub image is signed, refusing')
 
     # Remember how many sections originate from systemd-stub
     n_original_sections = len(pe.sections)
@@ -1005,6 +1053,47 @@ def pe_add_sections(uki: UKI, output: str) -> None:
             pe.__structures__.append(new_section)
             pe.sections.append(new_section)
 
+    # If there is a pre-signed JSON blob, we need to update the existing JSON, by appending the signature to
+    # each corresponding digest object. We have built the unsigned UKI with enough space to fit the .sig
+    # objects, so we can just replace the new signed JSON in the existing sections.
+    if opts.pcrsig:
+        signatures = json.loads(str(opts.pcrsig))
+        for i, section in enumerate(pe.sections):
+            if pe_strip_section_name(section.Name) == '.pcrsig':
+                j = json.loads(
+                    bytes(
+                        pe.__data__[
+                            section.PointerToRawData : section.PointerToRawData + section.SizeOfRawData
+                        ]
+                    )
+                    .rstrip(b'\x00')
+                    .decode()
+                )
+                for (bank, sigs), (input_bank, input_sigs) in itertools.product(
+                    j.items(), signatures.items()
+                ):
+                    if input_bank != bank:
+                        continue
+                    for sig, input_sig in itertools.product(sigs, input_sigs):
+                        if sig['pol'] == input_sig['pol']:
+                            sig['sig'] = input_sig['sig']
+
+                encoded = json.dumps(j).encode()
+                if len(encoded) > section.SizeOfRawData:
+                    raise PEError(
+                        f'Not enough space in existing section .pcrsig of size {section.SizeOfRawData} to append new data of size {len(encoded)}.'  # noqa: E501
+                    )
+
+                section.Misc_VirtualSize = len(encoded)
+                # bytes(n) results in an array of n zeroes
+                padding = bytes(section.SizeOfRawData - len(encoded))
+                pe.__data__ = (
+                    pe.__data__[: section.PointerToRawData]
+                    + encoded
+                    + padding
+                    + pe.__data__[section.PointerToRawData + section.SizeOfRawData :]
+                )
+
     pe.OPTIONAL_HEADER.CheckSum = 0
     pe.OPTIONAL_HEADER.SizeOfImage = round_up(
         pe.sections[-1].VirtualAddress + pe.sections[-1].Misc_VirtualSize,
@@ -1021,14 +1110,14 @@ def merge_sbat(input_pe: list[Path], input_text: list[str]) -> str:
         try:
             pe = pefile.PE(f, fast_load=True)
         except pefile.PEFormatError:
-            print(f'{f} is not a valid PE file, not extracting SBAT section.')
+            print(f'{f} is not a valid PE file, not extracting SBAT section.', file=sys.stderr)
             continue
 
         for section in pe.sections:
             if pe_strip_section_name(section.Name) == '.sbat':
                 split = section.get_data().rstrip(b'\x00').decode().splitlines()
                 if not split[0].startswith('sbat,'):
-                    print(f'{f} does not contain a valid SBAT section, skipping.')
+                    print(f'{f} does not contain a valid SBAT section, skipping.', file=sys.stderr)
                     continue
                 # Filter out the sbat line, we'll add it back later, there needs to be only one and it
                 # needs to be first.
@@ -1039,7 +1128,7 @@ def merge_sbat(input_pe: list[Path], input_text: list[str]) -> str:
             t = Path(t[1:]).read_text()
         split = t.splitlines()
         if not split[0].startswith('sbat,'):
-            print(f'{t} does not contain a valid SBAT section, skipping.')
+            print(f'{t} does not contain a valid SBAT section, skipping.', file=sys.stderr)
             continue
         sbat += split[1:]
 
@@ -1206,8 +1295,24 @@ def make_uki(opts: UkifyConfig) -> None:
     sign_args_present = opts.sb_key or opts.sb_cert_name
     sign_kernel = opts.sign_kernel
     linux = opts.linux
+    combined_sigs = '{}'
 
-    if opts.linux and sign_args_present:
+    # On some distros, on some architectures, the vmlinuz is a gzip file, so we need to decompress it
+    # if it's not a valid PE file, as it will fail to be booted by the firmware.
+    if linux:
+        try:
+            pefile.PE(linux, fast_load=True)
+        except pefile.PEFormatError:
+            try:
+                decompressed = maybe_decompress(linux)
+            except NotImplementedError:
+                print(f'{linux} is not a valid PE file and cannot be decompressed either', file=sys.stderr)
+            else:
+                print(f'{linux} is compressed and cannot be loaded by UEFI, decompressing', file=sys.stderr)
+                linux = Path(tempfile.NamedTemporaryFile(prefix='linux-decompressed').name)
+                linux.write_bytes(decompressed)
+
+    if linux and sign_args_present:
         assert opts.signtool is not None
         signtool = SignTool.from_string(opts.signtool)
 
@@ -1217,14 +1322,14 @@ def make_uki(opts: UkifyConfig) -> None:
 
         if sign_kernel:
             linux_signed = tempfile.NamedTemporaryFile(prefix='linux-signed')
+            signtool.sign(os.fspath(linux), os.fspath(Path(linux_signed.name)), opts=opts)
             linux = Path(linux_signed.name)
-            signtool.sign(os.fspath(opts.linux), os.fspath(linux), opts=opts)
 
-    if opts.uname is None and opts.linux is not None:
+    if opts.uname is None and linux is not None:
         print('Kernel version not specified, starting autodetection 😖.', file=sys.stderr)
-        opts.uname = Uname.scrape(opts.linux, opts=opts)
+        opts.uname = Uname.scrape(linux, opts=opts)
 
-    uki = UKI(opts.stub)
+    uki = UKI(opts.join_pcrsig if opts.join_pcrsig else opts.stub)
     initrd = join_initrds(opts.initrd)
 
     pcrpkey: Union[bytes, Path, None] = opts.pcrpkey
@@ -1243,6 +1348,13 @@ def make_uki(opts: UkifyConfig) -> None:
                 pcrpkey = subprocess.check_output(cmd)
             else:
                 pcrpkey = Path(opts.pcr_public_keys[0])
+        elif opts.pcr_certificates and len(opts.pcr_certificates) == 1:
+            cmd += ['--certificate', opts.pcr_certificates[0]]
+            if opts.certificate_provider:
+                cmd += ['--certificate-source', f'provider:{opts.certificate_provider}']
+
+            print('+', shell_join(cmd), file=sys.stderr)
+            pcrpkey = subprocess.check_output(cmd)
         elif opts.pcr_private_keys and len(opts.pcr_private_keys) == 1:
             cmd += ['--private-key', Path(opts.pcr_private_keys[0])]
 
@@ -1288,7 +1400,7 @@ def make_uki(opts: UkifyConfig) -> None:
         uki.add_section(section)
 
     # Don't add a sbat section to profile PE binaries.
-    if opts.join_profiles or not opts.profile:
+    if (opts.join_profiles or not opts.profile) and not opts.pcrsig:
         if linux is not None:
             # Merge the .sbat sections from stub, kernel and parameter, so that revocation can be done on
             # either.
@@ -1310,10 +1422,15 @@ def make_uki(opts: UkifyConfig) -> None:
 
     # PCR measurement and signing
 
-    if (opts.join_profiles or not opts.profile) and (
-        not opts.sign_profiles or opts.profile in opts.sign_profiles
+    if (
+        not opts.pcrsig
+        and (opts.join_profiles or not opts.profile)
+        and (
+            not opts.sign_profiles
+            or (opts.profile and read_env_file(opts.profile).get('ID') in opts.sign_profiles)
+        )
     ):
-        call_systemd_measure(uki, opts=opts)
+        combined_sigs = call_systemd_measure(uki, opts=opts)
 
     # UKI profiles
 
@@ -1367,10 +1484,12 @@ def make_uki(opts: UkifyConfig) -> None:
             pesection = next(s for s in pe.sections if pe_strip_section_name(s.Name) == '.profile')
             id = read_env_file(pesection.get_data(length=pe_section_size(pesection)).decode()).get('ID')
             if not id or id not in opts.sign_profiles:
-                print(f'Not signing expected PCR measurements for "{id}" profile')
+                print(f'Not signing expected PCR measurements for "{id}" profile', file=sys.stderr)
                 continue
 
-        call_systemd_measure(uki, opts=opts, profile_start=prev_len)
+        s = call_systemd_measure(uki, opts=opts, profile_start=prev_len)
+        if s:
+            combined_sigs = combine_signatures([json.loads(combined_sigs), json.loads(s)])
 
     # UKI creation
 
@@ -1380,7 +1499,7 @@ def make_uki(opts: UkifyConfig) -> None:
     else:
         unsigned_output = opts.output
 
-    pe_add_sections(uki, unsigned_output)
+    pe_add_sections(opts, uki, unsigned_output)
 
     # UKI signing
 
@@ -1395,6 +1514,8 @@ def make_uki(opts: UkifyConfig) -> None:
         os.chmod(opts.output, 0o777 & ~umask)
 
     print(f'Wrote {"signed" if sign_args_present else "unsigned"} {opts.output}', file=sys.stderr)
+    if opts.policy_digest:
+        print(combined_sigs)
 
 
 @contextlib.contextmanager
@@ -1507,22 +1628,22 @@ def generate_keys(opts: UkifyConfig) -> None:
             common_name=cn,
             valid_days=opts.sb_cert_validity,
         )
-        print(f'Writing SecureBoot private key to {opts.sb_key}')
+        print(f'Writing SecureBoot private key to {opts.sb_key}', file=sys.stderr)
         with temporary_umask(0o077):
             Path(opts.sb_key).write_bytes(key_pem)
-        print(f'Writing SecureBoot certificate to {opts.sb_cert}')
+        print(f'Writing SecureBoot certificate to {opts.sb_cert}', file=sys.stderr)
         Path(opts.sb_cert).write_bytes(cert_pem)
 
         work = True
 
-    for priv_key, pub_key, _ in key_path_groups(opts):
+    for priv_key, pub_key, _, _ in key_path_groups(opts):
         priv_key_pem, pub_key_pem = generate_priv_pub_key_pair()
 
-        print(f'Writing private key for PCR signing to {priv_key}')
+        print(f'Writing private key for PCR signing to {priv_key}', file=sys.stderr)
         with temporary_umask(0o077):
             Path(priv_key).write_bytes(priv_key_pem)
         if pub_key:
-            print(f'Writing public key for PCR signing to {pub_key}')
+            print(f'Writing public key for PCR signing to {pub_key}', file=sys.stderr)
             Path(pub_key).write_bytes(pub_key_pem)
 
         work = True
@@ -1560,7 +1681,7 @@ def inspect_section(
         try:
             struct['text'] = data.decode()
         except UnicodeDecodeError as e:
-            print(f'Section {name!r} is not valid text: {e}')
+            print(f'Section {name!r} is not valid text: {e}', file=sys.stderr)
             struct['text'] = '(not valid UTF-8)'
 
     if config and config.content:
@@ -1897,6 +2018,17 @@ CONFIG_ITEMS = [
         help='Which profiles to sign expected PCR measurements for',
     ),
     ConfigItem(
+        '--pcrsig',
+        metavar='TEST|@PATH',
+        help='Signed PCR policy JSON [.pcrsig section] to append to an existing UKI',
+        config_key='UKI/PCRSig',
+    ),
+    ConfigItem(
+        '--join-pcrsig',
+        metavar='PATH',
+        help='A PE binary containing a UKI without a .pcrsig to join with --pcrsig',
+    ),
+    ConfigItem(
         '--efi-arch',
         metavar='ARCH',
         choices=('ia32', 'x64', 'arm', 'aa64', 'riscv32', 'riscv64', 'loongarch32', 'loongarch64'),
@@ -2010,6 +2142,15 @@ CONFIG_ITEMS = [
         config_push=ConfigItem.config_set_group,
     ),
     ConfigItem(
+        '--pcr-certificate',
+        dest='pcr_certificates',
+        metavar='PATH',
+        action='append',
+        help='certificate part of the keypair or engine/provider designation for signing PCR signatures',
+        config_key='PCRSignature:/PCRCertificate',
+        config_push=ConfigItem.config_set_group,
+    ),
+    ConfigItem(
         '--phases',
         dest='phase_path_groups',
         metavar='PHASE-PATH…',
@@ -2116,7 +2257,7 @@ def apply_config(namespace: argparse.Namespace, filename: Union[str, Path, None]
             if item := CONFIGFILE_ITEMS.get(f'{section_name}/{key}'):
                 item.apply_config(namespace, section_name, group, key, value)
             else:
-                print(f'Unknown config setting [{section_name}] {key}=')
+                print(f'Unknown config setting [{section_name}] {key}=', file=sys.stderr)
 
 
 def config_example() -> Iterator[str]:
@@ -2208,17 +2349,27 @@ def finalize_options(opts: argparse.Namespace) -> None:
 
     # Check that --pcr-public-key=, --pcr-private-key=, and --phases=
     # have either the same number of arguments or are not specified at all.
+    # Also check that --pcr-public-key= and --pcr-certificate= are not set at the same time.
     # But allow a single public key, for offline PCR signing, to pre-populate the JSON object
     # with the certificate's fingerprint.
+    n_pcr_cert = None if opts.pcr_certificates is None else len(opts.pcr_certificates)
     n_pcr_pub = None if opts.pcr_public_keys is None else len(opts.pcr_public_keys)
     n_pcr_priv = None if opts.pcr_private_keys is None else len(opts.pcr_private_keys)
     n_phase_path_groups = None if opts.phase_path_groups is None else len(opts.phase_path_groups)
     if opts.policy_digest and n_pcr_priv is not None:
         raise ValueError('--pcr-private-key= cannot be specified with --policy-digest')
-    if opts.policy_digest and (n_pcr_pub is None or n_pcr_pub != 1):
-        raise ValueError('--policy-digest requires exactly one --pcr-public-key=')
+    if (
+        opts.policy_digest
+        and (n_pcr_pub is None or n_pcr_pub != 1)
+        and (n_pcr_cert is None or n_pcr_cert != 1)
+    ):
+        raise ValueError('--policy-digest requires exactly one --pcr-public-key= or --pcr-certificate=')
     if n_pcr_pub is not None and n_pcr_priv is not None and n_pcr_pub != n_pcr_priv:
         raise ValueError('--pcr-public-key= specifications must match --pcr-private-key=')
+    if n_pcr_cert is not None and n_pcr_priv is not None and n_pcr_cert != n_pcr_priv:
+        raise ValueError('--pcr-certificate= specifications must match --pcr-private-key=')
+    if n_pcr_pub is not None and n_pcr_cert is not None:
+        raise ValueError('--pcr-public-key= and --pcr-certificate= cannot be used at the same time')
     if n_phase_path_groups is not None and n_phase_path_groups != n_pcr_priv:
         raise ValueError('--phases= specifications must match --pcr-private-key=')
 
@@ -2241,7 +2392,7 @@ def finalize_options(opts: argparse.Namespace) -> None:
     if opts.efi_arch is None:
         opts.efi_arch = guess_efi_arch()
 
-    if opts.stub is None:
+    if opts.stub is None and not opts.join_pcrsig:
         if opts.linux is not None:
             opts.stub = Path(f'/usr/lib/systemd/boot/efi/linux{opts.efi_arch}.efi.stub')
         else:
@@ -2289,11 +2440,41 @@ def finalize_options(opts: argparse.Namespace) -> None:
         )
 
     opts.profile = resolve_at_path(opts.profile)
+    if opts.profile and isinstance(opts.profile, Path):
+        opts.profile = opts.profile.read_text()
 
     if opts.join_profiles and not opts.profile:
         # If any additional profiles are added, we need a base profile as well so add one if
         # one wasn't explicitly provided
         opts.profile = 'ID=main'
+
+    if opts.pcrsig and not opts.join_pcrsig:
+        raise ValueError('--pcrsig requires --join-pcrsig')
+    if opts.join_pcrsig and not opts.pcrsig:
+        raise ValueError('--join-pcrsig requires --pcrsig')
+    if opts.pcrsig and (
+        opts.linux
+        or opts.initrd
+        or opts.profile
+        or opts.join_profiles
+        or opts.microcode
+        or opts.sbat
+        or opts.uname
+        or opts.os_release
+        or opts.cmdline
+        or opts.hwids
+        or opts.splash
+        or opts.devicetree
+        or opts.devicetree_auto
+        or opts.pcr_private_keys
+        or opts.pcr_public_keys
+        or opts.pcr_certificates
+    ):
+        raise ValueError('--pcrsig and --join-pcrsig cannot be used with other sections')
+    if opts.pcrsig:
+        opts.pcrsig = resolve_at_path(opts.pcrsig)
+        if isinstance(opts.pcrsig, Path):
+            opts.pcrsig = opts.pcrsig.read_text()
 
     if opts.verb == 'build' and opts.output is None:
         if opts.linux is None:

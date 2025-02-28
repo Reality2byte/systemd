@@ -72,9 +72,6 @@ All tools:
   `/etc/veritytab`. Only useful for debugging. Currently only supported by
   `systemd-veritysetup-generator`.
 
-* `$SYSTEMD_EFI_OPTIONS` — if set, used instead of the string in the
-  `SystemdOptions` EFI variable. Analogous to `$SYSTEMD_PROC_CMDLINE`.
-
 * `$SYSTEMD_DEFAULT_HOSTNAME` — override the compiled-in fallback hostname
   (relevant in particular for the system manager and `systemd-hostnamed`).
   Must be a valid hostname (either a single label or a FQDN).
@@ -595,6 +592,13 @@ SYSTEMD_HOME_DEBUG_SUFFIX=foo \
   caused by parts of the session becoming unresponsive due to disk I/O while other
   parts of the session continue running. Thus, we highly recommend that this variable
   isn't used unless necessary. Defaults to true.
+
+`homectl`:
+
+* `$SYSTEMD_HOME_FIRSTBOOT_OVERRIDE` – if set to "1" will make `homectl
+  firstboot --prompt-new-user` interactively ask for user creation, even if
+  there already exists at least one regular user on the system. If set to "0"
+  will make the tool skip any such query.
 
 `kernel-install`:
 

@@ -1119,7 +1119,7 @@ static int acquire_new_home_record(sd_json_variant *input, UserRecord **ret) {
         assert(ret);
 
         if (arg_identity) {
-                unsigned line, column;
+                unsigned line = 0, column = 0;
 
                 if (input)
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Two identity records specified, refusing.");
@@ -1407,7 +1407,7 @@ static int bus_message_append_blobs(sd_bus_message *m, Hashmap *blobs) {
         return sd_bus_message_close_container(m);
 }
 
-static int create_home_common(sd_json_variant *input) {
+static int create_home_common(sd_json_variant *input, bool show_enforce_password_policy_hint) {
         _cleanup_(sd_bus_flush_close_unrefp) sd_bus *bus = NULL;
         _cleanup_(user_record_unrefp) UserRecord *hr = NULL;
         _cleanup_hashmap_free_ Hashmap *blobs = NULL;
@@ -1497,7 +1497,8 @@ static int create_home_common(sd_json_variant *input) {
                                 _cleanup_(erase_and_freep) char *new_password = NULL;
 
                                 log_error_errno(r, "%s", bus_error_message(&error, r));
-                                log_info("(Use --enforce-password-policy=no to turn off password quality checks for this account.)");
+                                if (show_enforce_password_policy_hint)
+                                        log_info("(Use --enforce-password-policy=no to turn off password quality checks for this account.)");
 
                                 r = acquire_new_password(hr->user_name, hr, /* suggest = */ false, &new_password);
                                 if (r < 0)
@@ -1550,7 +1551,7 @@ static int create_home(int argc, char *argv[], void *userdata) {
                         return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "User name required.");
         }
 
-        return create_home_common(/* input= */ NULL);
+        return create_home_common(/* input= */ NULL, /* show_enforce_password_policy_hint= */ true);
 }
 
 static int remove_home(int argc, char *argv[], void *userdata) {
@@ -1598,7 +1599,7 @@ static int acquire_updated_home_record(
         assert(ret);
 
         if (arg_identity) {
-                unsigned line, column;
+                unsigned line = 0, column = 0;
                 sd_json_variant *un;
 
                 r = sd_json_parse_file(
@@ -2392,7 +2393,7 @@ static int create_from_credentials(void) {
 
                 log_notice("Processing user '%s' from credentials.", e);
 
-                r = create_home_common(identity);
+                r = create_home_common(identity, /* show_enforce_password_policy_hint= */ false);
                 if (r >= 0)
                         n_created++;
 
@@ -2476,6 +2477,28 @@ static int acquire_group_list(char ***ret) {
         return !!*ret;
 }
 
+static int group_completion_callback(const char *key, char ***ret_list, void *userdata) {
+        char ***available = userdata;
+        int r;
+
+        if (!*available) {
+                r = acquire_group_list(available);
+                if (r < 0)
+                        log_debug_errno(r, "Failed to enumerate available groups, ignoring: %m");
+        }
+
+        _cleanup_strv_free_ char **l = strv_copy(*available);
+        if (!l)
+                return -ENOMEM;
+
+        r = strv_extend(&l, "list");
+        if (r < 0)
+                return r;
+
+        *ret_list = TAKE_PTR(l);
+        return 0;
+}
+
 static int create_interactively(void) {
         _cleanup_free_ char *username = NULL;
         int r;
@@ -2485,9 +2508,14 @@ static int create_interactively(void) {
                 return 0;
         }
 
-        any_key_to_proceed();
+        printf("\nPlease create your user account!\n");
 
-        (void) terminal_reset_defensive_locked(STDOUT_FILENO, /* switch_to_text= */ false);
+        if (!any_key_to_proceed()) {
+                log_notice("Skipping.");
+                return 0;
+        }
+
+        (void) terminal_reset_defensive_locked(STDOUT_FILENO, /* flags= */ 0);
 
         for (;;) {
                 username = mfree(username);
@@ -2521,13 +2549,34 @@ static int create_interactively(void) {
         if (r < 0)
                 return log_error_errno(r, "Failed to set userName field: %m");
 
-        _cleanup_strv_free_ char **available = NULL, **groups = NULL;
+        /* Let's not insist on a strong password in the firstboot interactive interface. Insisting on this is
+         * really annoying, as the user cannot just invoke the tool again with "--enforce-password-policy=no"
+         * because after all the tool is called from the boot process, and not from an interactive
+         * shell. Moreover, when setting up an initial system we can assume the user owns it, and hence we
+         * don't need to hard enforce some policy on password strength some organization or OS vendor
+         * requires. Note that this just disables the *strict* enforcement of the password policy. Even with
+         * this disabled we'll still tell the user in the UI that the password is too weak and suggest better
+         * ones, even if we then accept the weak ones if the user insists, by repeating it. */
+        r = sd_json_variant_set_field_boolean(&arg_identity_extra, "enforcePasswordPolicy", false);
+        if (r < 0)
+                return log_error_errno(r, "Failed to set enforcePasswordPolicy field: %m");
 
+        _cleanup_strv_free_ char **available = NULL, **groups = NULL;
         for (;;) {
                 _cleanup_free_ char *s = NULL;
-                unsigned u;
 
-                r = ask_string(&s,
+                strv_sort_uniq(groups);
+
+                if (!strv_isempty(groups)) {
+                        _cleanup_free_ char *j = strv_join(groups, ", ");
+                        if (!j)
+                                return log_oom();
+
+                        log_info("Currently selected groups: %s", j);
+                }
+
+                r = ask_string_full(&s,
+                               group_completion_callback, &available,
                                "%s Please enter an auxiliary group for user %s (empty to continue, \"list\" to list available groups): ",
                                special_glyph(SPECIAL_GLYPH_TRIANGULAR_BULLET), username);
                 if (r < 0)
@@ -2547,15 +2596,21 @@ static int create_interactively(void) {
                                         continue;
                         }
 
-                        r = show_menu(available, /*n_columns=*/ 3, /*width=*/ 20, /*percentage=*/ 60);
+                        r = show_menu(available,
+                                      /* n_columns= */ 3,
+                                      /* column_width= */ 20,
+                                      /* ellipsize_percentage= */ 60,
+                                      /* grey_prefix= */ NULL,
+                                      /* with_numbers= */ true);
                         if (r < 0)
-                                return r;
+                                return log_error_errno(r, "Failed to show menu: %m");
 
                         putchar('\n');
                         continue;
                 };
 
                 if (!strv_isempty(available)) {
+                        unsigned u;
                         r = safe_atou(s, &u);
                         if (r >= 0) {
                                 if (u <= 0 || u > strv_length(available)) {
@@ -2607,13 +2662,13 @@ static int create_interactively(void) {
                 shell = mfree(shell);
 
                 r = ask_string(&shell,
-                               "%s Please enter the shell to use for user %s (empty to skip): ",
+                               "%s Please enter the shell to use for user %s (empty for default): ",
                                special_glyph(SPECIAL_GLYPH_TRIANGULAR_BULLET), username);
                 if (r < 0)
                         return log_error_errno(r, "Failed to query user for username: %m");
 
                 if (isempty(shell)) {
-                        log_info("No data entered, skipping.");
+                        log_info("No data entered, leaving at default.");
                         break;
                 }
 
@@ -2640,7 +2695,7 @@ static int create_interactively(void) {
                         return log_error_errno(r, "Failed to set shell field: %m");
         }
 
-        return create_home_common(/* input= */ NULL);
+        return create_home_common(/* input= */ NULL, /* show_enforce_password_policy_hint= */ false);
 }
 
 static int verb_firstboot(int argc, char *argv[], void *userdata) {
@@ -2664,12 +2719,20 @@ static int verb_firstboot(int argc, char *argv[], void *userdata) {
         if (r > 0) /* Already created users from credentials */
                 return 0;
 
-        r = has_regular_user();
-        if (r < 0)
-                return r;
-        if (r > 0) {
-                log_info("Regular user already present in user database, skipping user creation.");
+        r = getenv_bool("SYSTEMD_HOME_FIRSTBOOT_OVERRIDE");
+        if (r == 0)
                 return 0;
+        if (r < 0) {
+                if (r != -ENXIO)
+                        log_warning_errno(r, "Failed to parse $SYSTEMD_HOME_FIRSTBOOT_OVERRIDE, ignoring: %m");
+
+                r = has_regular_user();
+                if (r < 0)
+                        return r;
+                if (r > 0) {
+                        log_info("Regular user already present in user database, skipping user creation.");
+                        return 0;
+                }
         }
 
         return create_interactively();
@@ -2774,6 +2837,7 @@ static int help(int argc, char *argv[], void *userdata) {
                "     --setenv=VARIABLE[=VALUE] Set an environment variable at log-in\n"
                "     --timezone=TIMEZONE       Set a time-zone\n"
                "     --language=LOCALE         Set preferred languages\n"
+               "     --default-area=AREA       Select default area\n"
                "\n%4$sAuthentication User Record Properties:%5$s\n"
                "     --ssh-authorized-keys=KEYS\n"
                "                               Specify SSH public keys\n"
@@ -2810,7 +2874,7 @@ static int help(int argc, char *argv[], void *userdata) {
                "     --enforce-password-policy=BOOL\n"
                "                               Control whether to enforce system's password\n"
                "                               policy for this user\n"
-               "  -P                           Same as --enforce-password-password=no\n"
+               "  -P                           Same as --enforce-password-policy=no\n"
                "     --password-change-now=BOOL\n"
                "                               Require the password to be changed on next login\n"
                "     --password-change-min=TIME\n"
@@ -2984,6 +3048,7 @@ static int parse_argv(int argc, char *argv[]) {
                 ARG_LOGIN_BACKGROUND,
                 ARG_TMP_LIMIT,
                 ARG_DEV_SHM_LIMIT,
+                ARG_DEFAULT_AREA,
         };
 
         static const struct option options[] = {
@@ -3086,6 +3151,7 @@ static int parse_argv(int argc, char *argv[]) {
                 { "login-background",             required_argument, NULL, ARG_LOGIN_BACKGROUND            },
                 { "tmp-limit",                    required_argument, NULL, ARG_TMP_LIMIT                   },
                 { "dev-shm-limit",                required_argument, NULL, ARG_DEV_SHM_LIMIT               },
+                { "default-area",                 required_argument, NULL, ARG_DEFAULT_AREA                },
                 {}
         };
 
@@ -4568,6 +4634,24 @@ static int parse_argv(int argc, char *argv[]) {
 
                         break;
                 }
+
+                case ARG_DEFAULT_AREA:
+                        if (isempty(optarg)) {
+                                r = drop_from_identity("defaultArea");
+                                if (r < 0)
+                                        return r;
+
+                                break;
+                        }
+
+                        if (!filename_is_valid(optarg))
+                                return log_error_errno(SYNTHETIC_ERRNO(EINVAL), "Parameter for default area field not valid: %s", optarg);
+
+                        r = sd_json_variant_set_field_string(&arg_identity_extra, "defaultArea", optarg);
+                        if (r < 0)
+                                return log_error_errno(r, "Failed to set default area field: %m");
+
+                        break;
 
                 case '?':
                         return -EINVAL;
